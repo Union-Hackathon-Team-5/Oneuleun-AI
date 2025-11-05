@@ -32,7 +32,7 @@ docker compose up --build
   요청 바디: `session_id`, `user_id`, `photo_url`  
   응답: 기본 감정 7종, 확장 정서 8종, 위험 징후 6종 중 해당 항목과 신뢰도/요약을 포함한 JSON
 - `POST /analyze/`  
-  요청 바디: `session_id`, `user_id`, `ai_questions`, `human_responses`, `expression_analysis`, `audio_url`  
+  요청 바디: `session_id`, `user_id`, `conversation`(질문:응답 딕셔너리 JSON 문자열), `audio_url`  
   응답: 입력 정보와 함께 S3 음성 데이터를 다운로드하여 고함 여부(`shout_detection`)를 반환합니다.
 
 ### 예시 요청
@@ -78,9 +78,7 @@ curl -X POST "http://localhost:8000/analyze/" \
   -d '{
     "session_id": "session_123",
     "user_id": "elderly_001",
-    "ai_questions": ["오늘 기분이 어떠세요?"],
-    "human_responses": ["오늘은 조금 피곤해요."],
-    "expression_analysis": {"emotion": "중립"},
+    "conversation": "{\"오늘 기분이 어떠세요?\": \"오늘은 조금 피곤해요.\"}",
     "audio_url": "https://example-bucket.s3.ap-northeast-2.amazonaws.com/audio/session_123.wav"
   }'
 ```
@@ -92,9 +90,7 @@ curl -X POST "http://localhost:8000/analyze/" \
   "success": true,
   "session_id": "session_123",
   "user_id": "elderly_001",
-  "ai_questions": ["오늘 기분이 어떠세요?"],
-  "human_responses": ["오늘은 조금 피곤해요."],
-  "expression_analysis": {"emotion": "중립"},
+  "conversation": "{\"오늘 기분이 어떠세요?\": \"오늘은 조금 피곤해요.\"}",
   "audio_url": "https://example-bucket.s3.ap-northeast-2.amazonaws.com/audio/session_123.wav",
   "shout_detection": {
     "present": false,

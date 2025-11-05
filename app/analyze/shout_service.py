@@ -10,8 +10,8 @@ from scipy.signal import resample_poly
 TARGET_SR = 16_000
 WIN_MS = 200
 HOP_MS = 100
-THRESH_DBFS = -10.0
-MIN_RUN_MS = 600
+THRESH_DBFS = -18.0
+MIN_RUN_MS = 400
 MAX_CREST_DB = 18.0
 
 
@@ -21,6 +21,7 @@ class ShoutResult:
     start_ms: Optional[int] = None
     end_ms: Optional[int] = None
     peak_dbfs: Optional[float] = None
+    duration_seconds: Optional[float] = None
     confidence: Optional[float] = None
 
 
@@ -78,21 +79,46 @@ def dbfs_from_rms(rms_val: float) -> float:
 
 def detect_shout(signal: np.ndarray, sr: int = TARGET_SR) -> ShoutResult:
     logger.info("Analyzing audio signal: samples=%d, sample_rate=%d", len(signal), sr)
+    print(f"[ShoutDetection] Analyzing signal samples={len(signal)} sr={sr}", flush=True)
     idxs, frames, win = frame_signal(signal, sr, WIN_MS, HOP_MS)
     if not frames:
         logger.info("No frames available for shout detection")
+        print("[ShoutDetection] No frames available", flush=True)
         return ShoutResult(present=False)
+
+    stats: List[Tuple[int, np.ndarray, float, float]] = []
+    for index, segment in zip(idxs, frames):
+        r = rms(segment)
+        db = dbfs_from_rms(r)
+        crest_db = crest_factor_db(segment, r)
+        stats.append((index, segment, db, crest_db))
+
+    db_values = [db for _, _, db, _ in stats]
+    if db_values:
+        median_db = float(np.median(db_values))
+    else:
+        median_db = -120.0
+
+    dynamic_threshold = min(THRESH_DBFS, median_db + 20.0)
+    logger.info(
+        "Shout detection thresholds -> base: %.2f dBFS, dynamic: %.2f dBFS (median=%.2f)",
+        THRESH_DBFS,
+        dynamic_threshold,
+        median_db,
+    )
+    print(
+        "[ShoutDetection] Thresholds base="
+        f"{THRESH_DBFS:.2f}dBFS dynamic={dynamic_threshold:.2f}dBFS median={median_db:.2f}",
+        flush=True,
+    )
 
     run_start = None
     run_end = None
     peak_db = -120.0
 
-    for index, segment in zip(idxs, frames):
-        r = rms(segment)
-        db = dbfs_from_rms(r)
-        crest_db = crest_factor_db(segment, r)
+    for index, segment, db, crest_db in stats:
 
-        loud = db >= THRESH_DBFS
+        loud = db >= dynamic_threshold
         not_impulsive = crest_db < MAX_CREST_DB
         if loud and not_impulsive:
             if run_start is None:
@@ -109,11 +135,20 @@ def detect_shout(signal: np.ndarray, sr: int = TARGET_SR) -> ShoutResult:
                         int(run_end * 1000 / sr),
                         peak_db,
                     )
+                    print(
+                        "[ShoutDetection] Detected mid-stream "
+                        f"start={int(run_start * 1000 / sr)}ms "
+                        f"end={int(run_end * 1000 / sr)}ms "
+                        f"peak={peak_db:.2f}dBFS",
+                        flush=True,
+                    )
+                    duration_seconds = round(duration_ms / 1000.0, 2)
                     return ShoutResult(
                         present=True,
                         start_ms=int(run_start * 1000 / sr),
                         end_ms=int(run_end * 1000 / sr),
                         peak_dbfs=float(round(peak_db, 2)),
+                        duration_seconds=duration_seconds,
                         confidence=0.6,
                     )
                 run_start = None
@@ -129,13 +164,23 @@ def detect_shout(signal: np.ndarray, sr: int = TARGET_SR) -> ShoutResult:
                 int(run_end * 1000 / sr),
                 peak_db,
             )
+            print(
+                "[ShoutDetection] Detected at end "
+                f"start={int(run_start * 1000 / sr)}ms "
+                f"end={int(run_end * 1000 / sr)}ms "
+                f"peak={peak_db:.2f}dBFS",
+                flush=True,
+            )
+            duration_seconds = round(duration_ms / 1000.0, 2)
             return ShoutResult(
                 present=True,
                 start_ms=int(run_start * 1000 / sr),
                 end_ms=int(run_end * 1000 / sr),
                 peak_dbfs=float(round(peak_db, 2)),
+                duration_seconds=duration_seconds,
                 confidence=0.6,
             )
 
     logger.info("Shout not detected")
+    print("[ShoutDetection] No shout detected", flush=True)
     return ShoutResult(present=False)

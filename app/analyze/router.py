@@ -1,5 +1,4 @@
 import logging
-from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, HttpUrl, Field
@@ -20,11 +19,7 @@ except Exception as exc:  # pragma: no cover - defensive
 class AnalyzeRequest(BaseModel):
     session_id: str = Field(..., description="상담 세션 ID")
     user_id: str = Field(..., description="노인 사용자 ID")
-    ai_questions: List[str] = Field(default_factory=list, description="AI 질문 목록")
-    human_responses: List[str] = Field(default_factory=list, description="사용자 응답 텍스트 목록")
-    expression_analysis: Optional[Dict[str, Any]] = Field(
-        default=None, description="표정 분석 결과(JSON)"
-    )
+    conversation: str = Field(..., description="질문:응답 딕셔너리(JSON 문자열)")
     audio_url: HttpUrl = Field(..., description="S3 음성 데이터 URL")
 
 
@@ -47,9 +42,7 @@ async def analyze_session(request: AnalyzeRequest):
         "success": True,
         "session_id": request.session_id,
         "user_id": request.user_id,
-        "ai_questions": request.ai_questions,
-        "human_responses": request.human_responses,
-        "expression_analysis": request.expression_analysis,
+        "conversation": request.conversation,
         "audio_url": str(request.audio_url),
         "shout_detection": shout_result,
     }
