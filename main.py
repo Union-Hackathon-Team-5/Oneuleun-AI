@@ -1,17 +1,14 @@
 from fastapi import FastAPI
 
-from app.context.router import router
+from app.context.router import router as context_router
+from app.analyze.router import router as analyze_router
 
-app = FastAPI()
+app = FastAPI(title="Oneuleun AI API", version="0.2.0")
 
-app.include_router(router)
+app.include_router(context_router)
+app.include_router(analyze_router)
 
 
 @app.get("/")
 async def root():
-    return {"message": "Hello World"}
-
-
-@app.get("/hello/{name}")
-async def say_hello(name: str):
-    return {"message": f"Hello {name}"}
+    return {"service": "Oneuleun AI API", "status": "running"}

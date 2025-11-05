@@ -2,7 +2,7 @@ import logging
 from fastapi import APIRouter, HTTPException, status
 
 from app.context.request.ContextRequest import ContextRequest
-from app.services.vision_service import VisionService, BASE_EMOTIONS, EXTENDED_EMOTIONS, WARNING_SIGNS
+from app.context.services.vision_service import VisionService, BASE_EMOTIONS, EXTENDED_EMOTIONS, WARNING_SIGNS
 
 logger = logging.getLogger(__name__)
 

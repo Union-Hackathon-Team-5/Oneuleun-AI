@@ -31,6 +31,9 @@ docker compose up --build
 - `POST /context/`  
   요청 바디: `session_id`, `user_id`, `photo_url`  
   응답: 기본 감정 7종, 확장 정서 8종, 위험 징후 6종 중 해당 항목과 신뢰도/요약을 포함한 JSON
+- `POST /analyze/`  
+  요청 바디: `session_id`, `user_id`, `ai_questions`, `human_responses`, `expression_analysis`, `audio_url`  
+  응답: 입력 정보와 함께 S3 음성 데이터를 다운로드하여 고함 여부(`shout_detection`)를 반환합니다.
 
 ### 예시 요청
 
@@ -63,6 +66,42 @@ curl -X POST "http://localhost:8000/context/" \
     "base_emotions": ["기쁨", "슬픔", "분노", "놀람", "공포", "혐오", "중립"],
     "extended_emotions": ["평온", "우울", "피로", "외로움", "불안", "긴장", "만족", "무기력"],
     "warning_signs": ["통증", "혼미", "호흡곤란", "장기침묵", "자책발언", "사회고립"]
+  }
+}
+```
+
+### 고함 감지 요청 예시
+
+```bash
+curl -X POST "http://localhost:8000/analyze/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session_123",
+    "user_id": "elderly_001",
+    "ai_questions": ["오늘 기분이 어떠세요?"],
+    "human_responses": ["오늘은 조금 피곤해요."],
+    "expression_analysis": {"emotion": "중립"},
+    "audio_url": "https://example-bucket.s3.ap-northeast-2.amazonaws.com/audio/session_123.wav"
+  }'
+```
+
+응답 예시:
+
+```json
+{
+  "success": true,
+  "session_id": "session_123",
+  "user_id": "elderly_001",
+  "ai_questions": ["오늘 기분이 어떠세요?"],
+  "human_responses": ["오늘은 조금 피곤해요."],
+  "expression_analysis": {"emotion": "중립"},
+  "audio_url": "https://example-bucket.s3.ap-northeast-2.amazonaws.com/audio/session_123.wav",
+  "shout_detection": {
+    "present": false,
+    "start_ms": null,
+    "end_ms": null,
+    "peak_dbfs": null,
+    "confidence": null
   }
 }
 ```

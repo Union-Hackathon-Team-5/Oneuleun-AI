@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -23,6 +23,12 @@ class VisionService:
         self.api_key = api_key
         self.model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
         self.base_url = "https://api.openai.com/v1/responses"
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=30.0)
+        return self._client
 
     async def analyze_emotion(self, image_url: str) -> Dict[str, Any]:
         if not image_url:
@@ -58,10 +64,10 @@ class VisionService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(self.base_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
+            client = await self._get_client()
+            response = await client.post(self.base_url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
 
             raw_text = self._extract_text(data)
             logger.debug("OpenAI raw response: %s", raw_text)
