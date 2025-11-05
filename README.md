@@ -12,6 +12,15 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
+## Docker 실행
+
+```bash
+# .env 파일에 OPENAI_API_KEY 값을 설정한 뒤
+docker compose up --build
+```
+
+기본적으로 8000 번 포트가 열리며 `http://localhost:8000/context/` 로 접근할 수 있습니다.
+
 ## 환경 변수
 
 - `OPENAI_API_KEY`: OpenAI Responses API 키 (필수)

@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Any, Dict, List
 
-from openai import AsyncOpenAI
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -13,61 +13,72 @@ WARNING_SIGNS: List[str] = ["통증", "혼미", "호흡곤란", "장기침묵", 
 
 
 class VisionService:
-    """Wrapper around the OpenAI Responses API for emotion classification."""
+    """HTTP-based wrapper around the OpenAI Responses API for emotion classification."""
 
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
 
-        self.client = AsyncOpenAI(api_key=api_key)
-        self.responses: Any = self.client.responses  # type: ignore[attr-defined]
+        self.api_key = api_key
         self.model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+        self.base_url = "https://api.openai.com/v1/responses"
 
     async def analyze_emotion(self, image_url: str) -> Dict[str, Any]:
         if not image_url:
             raise ValueError("image_url is required for analysis")
 
-        prompt = self._build_prompt()
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "당신은 노인 복지 센터에서 사용하는 감정 분석 도우미입니다.",
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": self._build_prompt()},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                },
+            ],
+            "temperature": 0.1,
+            "top_p": 0.8,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
         try:
-            response = await self.responses.create(
-                model=self.model,
-                input=[
-                    {
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "당신은 노인 복지 센터에서 사용하는 감정 분석 도우미입니다.",
-                            }
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": image_url},
-                        ],
-                    },
-                ],
-                temperature=0.1,
-                top_p=0.8,
-            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(self.base_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
 
-            raw_text = self._extract_text(response)
+            raw_text = self._extract_text(data)
             logger.debug("OpenAI raw response: %s", raw_text)
 
             parsed = json.loads(raw_text)
             self._validate_response(parsed)
             return parsed
+        except httpx.HTTPStatusError as exc:
+            logger.error("OpenAI API returned %s: %s", exc.response.status_code, exc.response.text)
+            raise RuntimeError("OpenAI 분석 요청이 거부되었습니다.") from exc
         except json.JSONDecodeError as exc:
             logger.error("Failed to decode OpenAI response: %s", exc)
             raise ValueError("모델 응답을 해석하지 못했습니다. 다시 시도해주세요.") from exc
         except ValueError:
             raise
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("OpenAI API 호출이 실패했습니다: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Unexpected error while calling OpenAI: %s", exc)
             raise RuntimeError("OpenAI 분석 요청 중 오류가 발생했습니다.") from exc
 
     def _build_prompt(self) -> str:
@@ -90,18 +101,16 @@ class VisionService:
             "선택지는 반드시 위에서 제시한 단어만 사용하세요."
         )
 
-    def _extract_text(self, response: Any) -> str:
-        if hasattr(response, "output_text") and response.output_text:
-            return response.output_text.strip()
+    def _extract_text(self, response: Dict[str, Any]) -> str:
+        output_text = response.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
 
-        # Fallback for structured output
         chunks: List[str] = []
-        output = getattr(response, "output", []) or []
-        for item in output:
-            content = getattr(item, "content", []) or []
-            for block in content:
-                if getattr(block, "type", None) == "output_text" and getattr(block, "text", None):
-                    chunks.append(block.text)
+        for item in response.get("output", []):
+            for block in item.get("content", []):
+                if block.get("type") == "output_text" and block.get("text"):
+                    chunks.append(block["text"])
 
         if not chunks:
             raise ValueError("모델에서 텍스트 응답을 받지 못했습니다.")

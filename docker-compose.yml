@@ -1,0 +1,16 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oneuleun-backend:latest
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - OPENAI_VISION_MODEL=${OPENAI_VISION_MODEL:-gpt-4o-mini}
+    volumes:
+      - ./:/app:ro
