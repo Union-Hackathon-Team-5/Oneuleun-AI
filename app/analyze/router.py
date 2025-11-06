@@ -4,10 +4,8 @@ from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel, HttpUrl, Field
 
 from app.analyze.service import AnalyzeService
-from app.services.analysis_service import AnalysisService
-from app.models.analysis_models import (
-    ComprehensiveAnalysisResult, SummaryCard, AlertInfo
-)
+from app.services.caregiver_service import CaregiverService
+from app.models.caregiver_models import CaregiverFriendlyResponse
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +18,10 @@ except Exception as exc:  # pragma: no cover - defensive
     analyze_service = None
 
 try:
-    analysis_service = AnalysisService()
+    caregiver_service = CaregiverService()
 except Exception as exc:
-    logger.error("Failed to initialise AnalysisService: %s", exc)
-    analysis_service = None
+    logger.error("Failed to initialise CaregiverService: %s", exc)
+    caregiver_service = None
 
 
 class AnalyzeRequest(BaseModel):
@@ -58,14 +56,14 @@ async def analyze_session(request: AnalyzeRequest):
     }
 
 
-@router.post("/upload", summary="상담 세션 종합 분석 (파일 업로드 + 대화 분석)")
+@router.post("/upload", summary="영상 편지 종합 분석 (보호자 친화적)", response_model=CaregiverFriendlyResponse)
 async def analyze_session_with_upload(
     session_id: str = Form(...),
     user_id: str = Form(...),
     conversation: str = Form(..., description="AI 질문과 노인 응답이 포함된 대화 내용"),
     audio_file: UploadFile = File(...),
 ):
-    if not analyze_service or not analysis_service:
+    if not analyze_service or not caregiver_service:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="분석 서비스가 초기화되지 않았습니다.",
@@ -81,91 +79,76 @@ async def analyze_session_with_upload(
             content_type=audio_file.content_type,
         )
         
-        # TODO: 세션 ID로 이미지 URL 가져오기 (사용자가 구현 예정)
-        # image_url = get_image_url_by_session_id(session_id)
-        image_url = f"placeholder_image_url_for_session_{session_id}"
+        # TODO: 세션 ID로 이미지 분석 결과 가져오기 (사용자가 구현 예정)
+        # image_analysis = get_image_analysis_by_session_id(session_id)
+        image_analysis = _get_dummy_image_analysis(session_id)
         
-        # 대화 기반 종합 분석 (병렬 처리)
-        comprehensive_analysis = await analysis_service.analyze_video_letter_comprehensive(conversation)
+        # 보호자 친화적 종합 리포트 생성
+        caregiver_report = await caregiver_service.generate_caregiver_friendly_report(
+            conversation=conversation,
+            image_analysis=image_analysis,
+            audio_analysis=upload_result,
+            session_id=session_id,
+            user_id=user_id
+        )
         
-        # 종합 결과 생성
-        summary_card = _generate_summary_card(comprehensive_analysis)
-        alert_info = _generate_alert_info(comprehensive_analysis)
-        
-        return {
-            "success": True,
-            "session_id": session_id,
-            "user_id": user_id,
-            "conversation": conversation,
-            "image_url": image_url,
-            "audio_analysis": upload_result,
-            "comprehensive_analysis": comprehensive_analysis.dict(),
-            "summary_card": summary_card.dict(),
-            "alert_info": alert_info.dict(),
-        }
+        return caregiver_report
         
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("Failed to process uploaded audio and conversation analysis")
+        logger.exception("Failed to process caregiver-friendly analysis")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="업로드 및 분석 처리 중 오류가 발생했습니다.",
+            detail="영상 편지 분석 처리 중 오류가 발생했습니다.",
         ) from exc
 
 
-def _generate_summary_card(analysis: ComprehensiveAnalysisResult) -> SummaryCard:
-    """📊 오늘의 상태 요약 카드 생성"""
-    from app.models.analysis_models import EmotionScore
+def _get_dummy_image_analysis(session_id: str) -> dict:
+    """더미 이미지 분석 결과 생성 (세션 ID 기반)"""
+    import random
     
-    return SummaryCard(
-        status_emoji=analysis.comprehensive_summary.status_emoji,
-        status_text=analysis.comprehensive_summary.status_text,
-        emotion_scores=EmotionScore(
-            positive=analysis.emotion_analysis.positive,
-            anxiety=analysis.emotion_analysis.anxiety,
-            depression=analysis.emotion_analysis.depression
-        ),
-        main_summary=analysis.comprehensive_summary.main_summary,
-        overall_mood=analysis.emotion_analysis.overall_mood
-    )
-
-
-def _generate_alert_info(analysis: ComprehensiveAnalysisResult) -> AlertInfo:
-    """🚨 알림 정보 생성"""
-    comprehensive = analysis.comprehensive_summary
-    risk = analysis.risk_analysis
+    # 다양한 더미 데이터 패턴
+    dummy_patterns = [
+        {
+            "emotion": ["기쁨"],
+            "summary": "노인이 밝은 표정으로 미소를 짓고 있습니다.",
+            "concerns": []
+        },
+        {
+            "emotion": ["슬픔"],
+            "summary": "노인이 손으로 얼굴을 가리고 있어 슬픔을 표현하고 있습니다.",
+            "concerns": ["우울증 우려"]
+        },
+        {
+            "emotion": ["외로움", "슬픔"],
+            "summary": "노인이 혼자 앉아 있으며 외로운 표정을 짓고 있습니다.",
+            "concerns": ["사회적 고립", "우울증 우려"]
+        },
+        {
+            "emotion": ["무기력함"],
+            "summary": "노인이 기운이 없어 보이며 무기력한 상태입니다.",
+            "concerns": ["식사 거부 징후", "건강 상태 악화 우려"]
+        },
+        {
+            "emotion": ["분노"],
+            "summary": "노인이 화난 표정을 짓고 있습니다.",
+            "concerns": ["스트레스 증가", "혈압 상승 우려"]
+        },
+        {
+            "emotion": ["행복", "기쁨"],
+            "summary": "노인이 매우 밝고 행복한 표정으로 웃고 있습니다.",
+            "concerns": []
+        }
+    ]
     
-    alert_needed = comprehensive.alert_needed
-    requires_immediate = comprehensive.requires_immediate_attention
+    # 세션 ID 기반으로 일관된 더미 데이터 선택
+    random.seed(hash(session_id) % 1000)
+    selected_pattern = random.choice(dummy_patterns)
     
-    if not alert_needed:
-        return AlertInfo(
-            alert_type="none",
-            message="현재 특별한 주의사항이 없습니다.",
-            priority="보통",
-            detected_keywords=[],
-            immediate_concerns=[],
-            recommended_actions=["정기적인 모니터링 유지"],
-            requires_immediate_attention=False
-        )
-    
-    alert_type = "urgent" if requires_immediate else "attention"
-    
-    # 알림 메시지 생성
-    risk_keywords = risk.detected_keywords
-    
-    if requires_immediate:
-        message = f"🚨 긴급 알림 - 위험 키워드 감지: {', '.join(risk_keywords[:3])}"
-    else:
-        message = f"📊 주의 필요 - {comprehensive.main_summary}"
-    
-    return AlertInfo(
-        alert_type=alert_type,
-        message=message,
-        priority=comprehensive.priority_level,
-        detected_keywords=risk_keywords,
-        immediate_concerns=comprehensive.key_concerns,
-        recommended_actions=comprehensive.recommended_actions,
-        requires_immediate_attention=requires_immediate
-    )
+    return {
+        "analysis": selected_pattern,
+        "confidence": random.randint(75, 95),
+        "confidence_level": "높음",
+        "confidence_comment": "모델이 감정 분류에 대해 상당한 확신을 갖고 있습니다."
+    }

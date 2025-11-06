@@ -62,15 +62,33 @@ class AnalysisService:
             logger.error("OpenAI API call failed: %s", exc)
             raise
     
-    async def analyze_emotion_state(self, conversation: str) -> EmotionAnalysis:
-        """감정 상태 분석"""
+    async def analyze_emotion_state(self, conversation: str, image_analysis: Optional[Dict] = None) -> EmotionAnalysis:
+        """감정 상태 분석 (대화 + 이미지 분석 종합)"""
+        
+        # 이미지 분석 데이터가 있으면 추가 컨텍스트로 활용
+        image_context = ""
+        if image_analysis and "analysis" in image_analysis:
+            img_data = image_analysis["analysis"]
+            emotions = ", ".join(img_data.get("emotion", []))
+            summary = img_data.get("summary", "")
+            concerns = img_data.get("concerns", [])
+            
+            image_context = f"""
+
+이미지 분석 결과:
+- 감정: {emotions}
+- 표정 설명: {summary}
+- 우려사항: {", ".join(concerns) if concerns else "없음"}
+"""
+        
         prompt = f"""
 다음 독거노인과 AI의 대화를 분석하여 감정 상태를 파악해주세요.
 
 대화 내용:
 {conversation}
+{image_context}
 
-다음 JSON 형식으로 응답해주세요:
+위 대화 내용과 이미지 분석 결과를 종합하여 다음 JSON 형식으로 응답해주세요:
 {{
     "positive": <0-100 긍정 점수>,
     "negative": <0-100 부정 점수>,
@@ -129,15 +147,32 @@ class AnalysisService:
                 mood_indicators=[]
             )
     
-    async def detect_risk_keywords(self, conversation: str) -> RiskAnalysis:
-        """위험 키워드 감지"""
+    async def detect_risk_keywords(self, conversation: str, image_analysis: Optional[Dict] = None) -> RiskAnalysis:
+        """위험 키워드 감지 (대화 + 이미지 분석 종합)"""
+        
+        # 이미지 분석에서 우려사항 추출
+        image_context = ""
+        if image_analysis and "analysis" in image_analysis:
+            img_data = image_analysis["analysis"]
+            concerns = img_data.get("concerns", [])
+            emotions = img_data.get("emotion", [])
+            
+            if concerns or any(emotion in ["슬픔", "무기력함"] for emotion in emotions):
+                image_context = f"""
+
+이미지 분석에서 감지된 우려사항:
+- 감정 상태: {", ".join(emotions)}
+- 우려사항: {", ".join(concerns) if concerns else "없음"}
+"""
+        
         prompt = f"""
 다음 독거노인과 AI의 대화에서 위험 신호나 주의가 필요한 키워드를 감지해주세요.
 
 대화 내용:
 {conversation}
+{image_context}
 
-다음 JSON 형식으로 응답해주세요:
+위 대화 내용과 이미지 분석 결과를 종합하여 다음 JSON 형식으로 응답해주세요:
 {{
     "risk_level": "<긴급/주의/보통/안전>",
     "detected_keywords": ["<위험키워드1>", "<위험키워드2>", ...],
@@ -152,6 +187,7 @@ class AnalysisService:
 }}
 
 위험 키워드 예시: 넘어졌어요, 아파요, 밥을 못 먹었어요, 어지러워요, 숨이 차요, 혼자 무서워요 등
+이미지에서 "우울증 우려", "자살 위험 의심" 등이 감지되면 반드시 mental 카테고리에 포함하세요.
 """
         
         try:
@@ -215,14 +251,15 @@ class AnalysisService:
     async def analyze_video_letter_comprehensive(
         self, 
         conversation: str, 
-        historical_data: Optional[List[Dict]] = None
+        historical_data: Optional[List[Dict]] = None,
+        image_analysis: Optional[Dict] = None
     ) -> ComprehensiveAnalysisResult:
         """영상 편지 종합 분석 (병렬 처리)"""
         
-        # 모든 분석을 병렬로 실행
-        emotion_task = self.analyze_emotion_state(conversation)
+        # 모든 분석을 병렬로 실행 (이미지 분석 데이터 포함)
+        emotion_task = self.analyze_emotion_state(conversation, image_analysis)
         content_task = self.analyze_conversation_content(conversation)
-        risk_task = self.detect_risk_keywords(conversation)
+        risk_task = self.detect_risk_keywords(conversation, image_analysis)
         anomaly_task = self.detect_anomaly_patterns(conversation, historical_data)
         
         try:
