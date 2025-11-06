@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 BASE_EMOTIONS: List[str] = ["기쁨", "슬픔", "분노", "놀람", "공포", "혐오", "중립"]
 EXTENDED_EMOTIONS: List[str] = ["평온", "우울", "피로", "외로움", "불안", "긴장", "만족", "무기력"]
 WARNING_SIGNS: List[str] = ["통증", "혼미", "호흡곤란", "장기침묵", "자책발언", "사회고립"]
+ALL_EMOTION_LABELS: List[str] = BASE_EMOTIONS + EXTENDED_EMOTIONS + WARNING_SIGNS
+
+logger.info("Loaded emotion labels: %s", ALL_EMOTION_LABELS)
+print(f"[ContextEmotionLabels] {ALL_EMOTION_LABELS}", flush=True)
 
 
 class VisionService:
