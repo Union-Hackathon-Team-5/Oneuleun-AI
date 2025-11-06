@@ -1,9 +1,12 @@
 import asyncio
+import contextlib
 import json
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
+
+from pydantic import ValidationError
 
 from app.models.caregiver_models import (
     CaregiverFriendlyResponse, StatusOverview, TodaySummary, KeyConcern,
@@ -23,6 +26,22 @@ class CaregiverService:
     
     def __init__(self):
         self.analysis_service = AnalysisService()
+        self._concern_type_aliases = {
+            "신체": "건강",
+            "신체건강": "건강",
+            "의료": "건강",
+            "통증": "건강",
+            "health": "건강",
+            "safety": "안전",
+            "안전위험": "안전",
+            "정신": "정서",
+            "정신건강": "정서",
+            "외로움": "정서",
+            "고립": "정서",
+            "생활환경": "생활",
+            "일상": "생활",
+            "환경": "생활",
+        }
     
     async def generate_caregiver_friendly_report(
         self,
@@ -40,7 +59,7 @@ class CaregiverService:
         print(f"[PERF] Starting comprehensive_analysis", flush=True)
         logger.info("[PERF] Starting comprehensive_analysis")
         comp_start = time.time()
-        comprehensive_analysis = await self.analysis_service.analyze_video_letter_comprehensive(
+        comprehensive_analysis, fact_snapshot = await self.analysis_service.analyze_video_letter_comprehensive(
             conversation=conversation,
             image_analysis=image_analysis,
             historical_data=historical_data
@@ -58,6 +77,7 @@ class CaregiverService:
             conversation=conversation,
             image_analysis=image_analysis,
             audio_analysis=audio_analysis,
+            fact_snapshot=fact_snapshot,
             session_id=session_id,
             user_id=user_id
         )
@@ -76,76 +96,92 @@ class CaregiverService:
         conversation: str,
         image_analysis: Dict,
         audio_analysis: Dict,
+        fact_snapshot: Dict[str, Any],
         session_id: str,
         user_id: str
     ) -> CaregiverFriendlyResponse:
         """기술적 분석을 보호자 친화적 형태로 변환"""
         
-        # 감성적 인사이트 생성 (병렬 처리, 타임아웃 적용)
-        print(f"[PERF] Starting parallel LLM calls (4 tasks)", flush=True)
-        logger.info("[PERF] Starting parallel LLM calls (4 tasks)")
-        parallel_start = time.time()
-        
-        # 각 작업에 타임아웃 래퍼 적용 (15초)
-        async def insights_with_timeout():
-            try:
-                return await asyncio.wait_for(
-                    self._generate_emotional_insights(conversation, comprehensive_analysis),
-                    timeout=15.0
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Emotional insights generation failed/timeout: {exc}")
-                return {
-                    "headline": "어머니 상태를 확인이 필요합니다",
-                    "mood_description": "평소보다 기분이 좋지 않으신 것 같아요",
-                    "energy_level": "활력이 부족해 보입니다",
-                    "pain_level": "몸이 불편하신 것 같아요",
-                    "emotional_state": "관심과 돌봄이 필요한 상태입니다"
-                }
-        
-        async def action_plan_with_timeout():
-            try:
-                return await asyncio.wait_for(
-                    self._generate_actionable_plan(comprehensive_analysis, conversation),
-                    timeout=15.0
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Action plan generation failed/timeout: {exc}")
-                return self._create_default_action_plan(comprehensive_analysis)
-        
-        async def mother_voice_with_timeout():
-            try:
-                return await asyncio.wait_for(
-                    self._extract_mother_voice(conversation),
-                    timeout=15.0
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Mother voice extraction failed/timeout: {exc}")
-                return [
-                    "💬 \"요즘 컨디션이 별로 좋지 않아요\"",
-                    "💬 \"혼자 있는 시간이 많아서 외로워요\"",
-                    "💬 \"몸이 예전 같지 않아서 걱정이에요\""
-                ]
-        
-        async def concerns_with_timeout():
-            try:
-                return await asyncio.wait_for(
-                    self._identify_key_concerns(comprehensive_analysis, conversation, image_analysis),
-                    timeout=15.0
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Key concerns identification failed/timeout: {exc}")
-                return self._create_default_concerns(comprehensive_analysis)
-        
-        emotional_insights, action_plan, mother_voice, key_concerns = await asyncio.gather(
-            insights_with_timeout(),
-            action_plan_with_timeout(),
-            mother_voice_with_timeout(),
-            concerns_with_timeout()
+        print(f"[PERF] Starting caregiver task race (bundle vs fallback)", flush=True)
+        logger.info("[PERF] Starting caregiver task race (bundle vs fallback)")
+        race_start = time.time()
+
+        bundle_task = asyncio.create_task(
+            self._generate_caregiver_bundle(
+                conversation=conversation,
+                comprehensive_analysis=comprehensive_analysis,
+                image_analysis=image_analysis,
+                fact_snapshot=fact_snapshot
+            ),
+            name="caregiver_bundle"
         )
-        parallel_time = time.time() - parallel_start
-        print(f"[PERF] Parallel LLM calls completed in {parallel_time:.2f}s", flush=True)
-        logger.info(f"[PERF] Parallel LLM calls completed in {parallel_time:.2f}s")
+        fallback_task = asyncio.create_task(
+            self._run_legacy_caregiver_tasks(
+                comprehensive_analysis=comprehensive_analysis,
+                conversation=conversation,
+                image_analysis=image_analysis
+            ),
+            name="caregiver_fallback"
+        )
+
+        emotional_insights: Dict[str, Any]
+        action_plan: ActionPlan
+        mother_voice: List[str]
+        key_concerns: List[KeyConcern]
+
+        done, pending = await asyncio.wait(
+            {bundle_task, fallback_task},
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        bundle_result: Optional[Dict[str, Any]] = None
+        fallback_result: Optional[Tuple[Dict[str, Any], ActionPlan, List[str], List[KeyConcern]]] = None
+
+        if bundle_task in done:
+            try:
+                bundle_result = bundle_task.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Caregiver bundle execution error: %s", exc)
+                bundle_result = None
+
+        if fallback_task in done:
+            try:
+                fallback_result = fallback_task.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Fallback caregiver tasks error: %s", exc)
+                fallback_result = None
+
+        # Decide which result to use
+        if bundle_result:
+            # cancel fallback if still running
+            if fallback_task not in done:
+                fallback_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await fallback_task
+            emotional_insights, action_plan, mother_voice, key_concerns = self._parse_bundle_result(
+                bundle_result,
+                comprehensive_analysis
+            )
+            winner = "bundle"
+        else:
+            if fallback_result is None:
+                # Wait for fallback to finish if bundle failed
+                fallback_result = await fallback_task
+            else:
+                if bundle_task not in done:
+                    bundle_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await bundle_task
+            emotional_insights, action_plan, mother_voice, key_concerns = fallback_result
+            winner = "fallback"
+
+        race_time = time.time() - race_start
+        print(f"[PERF] Caregiver task race winner: {winner} in {race_time:.2f}s", flush=True)
+        logger.info("[PERF] Caregiver task race winner: %s in %.2fs", winner, race_time)
         
         # 병렬 LLM 호출 이후 후처리 작업들 시간 측정
         post_process_start = time.time()
@@ -251,7 +287,60 @@ class CaregiverService:
                 "pain_level": "몸이 불편하신 것 같아요",
                 "emotional_state": "관심과 돌봄이 필요한 상태입니다"
             }
-    
+
+    def _build_action_plan_from_dict(self, data: Dict) -> ActionPlan:
+        """LLM이 생성한 딕셔너리를 ActionPlan 모델로 변환 (우선순위 정규화, 중복 제거 포함)"""
+        valid_priorities = ["최우선", "긴급", "중요"]
+
+        def normalize_action(action: Dict) -> Dict:
+            if "priority" in action:
+                priority = action["priority"]
+                if priority not in valid_priorities:
+                    if priority in ["보통", "낮음", "normal", "low"]:
+                        action["priority"] = "중요"
+                    elif priority in ["높음", "high", "urgent"]:
+                        action["priority"] = "긴급"
+                    else:
+                        action["priority"] = "중요"
+            else:
+                action["priority"] = "중요"
+            return action
+
+        def deduplicate(actions: List[Dict]) -> List[Dict]:
+            seen_titles = set()
+            unique_actions = []
+            for action in actions:
+                title = action.get("title", "").strip()
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                unique_actions.append(action)
+            return unique_actions
+
+        urgent_actions_raw = deduplicate(data.get("urgent_actions", []))
+        this_week_actions_raw = deduplicate(data.get("this_week_actions", []))
+        long_term_actions_raw = deduplicate(data.get("long_term_actions", []))
+
+        urgent_actions = [UrgentAction.model_validate(normalize_action(action)) for action in urgent_actions_raw]
+        this_week_actions = [UrgentAction.model_validate(normalize_action(action)) for action in this_week_actions_raw]
+        long_term_actions = [UrgentAction.model_validate(normalize_action(action)) for action in long_term_actions_raw]
+
+        return ActionPlan(
+            urgent_actions=urgent_actions,
+            this_week_actions=this_week_actions,
+            long_term_actions=long_term_actions
+        )
+
+    def _normalize_concern_entry(self, concern: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        concern = dict(concern)
+        concern_type = str(concern.get("type", "")).strip()
+        normalized = self._concern_type_aliases.get(concern_type, concern_type)
+        if normalized not in {"건강", "안전", "정서", "생활"}:
+            logger.warning("Unknown concern type '%s' at index %s, defaulting to '정서'", concern_type, idx)
+            normalized = "정서"
+        concern["type"] = normalized
+        return concern
+
     async def _generate_actionable_plan(
         self, 
         analysis: ComprehensiveAnalysisResult, 
@@ -266,66 +355,39 @@ class CaregiverService:
             if significant:
                 baseline_context = f"\n개인 baseline 비교: {len(significant)}개의 유의미한 변화 감지"
         
-        # 프롬프트 간소화: 핵심만 포함
-        key_concerns_str = ", ".join(analysis.comprehensive_summary.key_concerns[:3]) if analysis.comprehensive_summary.key_concerns else "없음"
-        recommended_str = ", ".join(analysis.comprehensive_summary.recommended_actions[:3]) if analysis.comprehensive_summary.recommended_actions else "없음"
+        # 프롬프트 최적화: 더 간결하게
+        key_concerns_str = ", ".join(analysis.comprehensive_summary.key_concerns[:2]) if analysis.comprehensive_summary.key_concerns else "없음"
+        recommended_str = ", ".join(analysis.comprehensive_summary.recommended_actions[:2]) if analysis.comprehensive_summary.recommended_actions else "없음"
         
-        prompt = f"""분석 결과 기반 행동 계획 생성 (간결하게):
+        prompt = f"""행동 계획 생성 (간결, 필수만):
 
-대화 요약: {conversation[:300]}...
 위험도: {analysis.comprehensive_summary.priority_level}
-주요 우려: {key_concerns_str}
-권장 조치: {recommended_str}
-{baseline_context}
+우려: {key_concerns_str}
+조치: {recommended_str}
 
-JSON 형식으로 응답 (각 카테고리 최대 3개):
+JSON 응답 (최소화):
 {{
-    "urgent_actions": [{{"action_id": 1, "priority": "최우선|긴급|중요", "icon": "📞", "title": "구체적 행동", "reason": "이유", "detail": "어머니 말씀 인용", "deadline": "언제까지", "estimated_time": "소요시간", "suggested_topics": ["대화예시1", "대화예시2"]}}],
-    "this_week_actions": [...],
-    "long_term_actions": [...]
+    "urgent_actions": [{{"action_id": 1, "priority": "최우선", "icon": "📞", "title": "제목", "reason": "이유", "detail": "말씀", "deadline": "오늘", "estimated_time": "10분", "suggested_topics": ["예시1", "예시2"]}}],
+    "this_week_actions": [{{"action_id": 2, "priority": "중요", "icon": "📅", "title": "제목", "reason": "이유", "detail": "말씀", "deadline": "이번주", "estimated_time": "30분", "suggested_topics": ["예시"]}}],
+    "long_term_actions": []
 }}
 
-주의: urgent_actions는 긴급시 1-2개만. priority는 "최우선", "긴급", "중요" 중 하나만. 건강 관련은 "의료진 상담 권장" 표현 사용.
+규칙:
+- urgent 최대 2개, this_week 최대 3개, long_term 최대 2개.
+- 연락 방법은 반복하지 말고 다양하게 제시 (예: 전화, 음성 메시지, 영상 통화 예약, 방문 일정, 복지센터 프로그램 등).
+- 각 액션은 구체적 이유와 실행 방법을 제공하고, 1-2문장으로 간결하게 작성.
+- priority는 "최우선", "긴급", "중요"만.
 """
         
         try:
             task_start = time.time()
-            # max_tokens를 600으로 줄임 (실제로는 urgent 2개 + this_week 3개 + long_term 2개 정도면 충분)
-            response = await self.analysis_service._call_openai(prompt, max_tokens=600, task_name="_generate_actionable_plan")
+            # max_tokens를 500으로 더 줄임 (각 액션 필드를 더 간결하게 만들었으므로)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=500, task_name="_generate_actionable_plan")
             task_time = time.time() - task_start
             print(f"[PERF] _generate_actionable_plan API call: {task_time:.2f}s", flush=True)
             logger.debug(f"[PERF] _generate_actionable_plan API call: {task_time:.2f}s")
             data = json.loads(response)
-            
-            # priority 필드 검증 및 기본값 처리
-            valid_priorities = ["최우선", "긴급", "중요"]
-            
-            def normalize_action(action: Dict) -> Dict:
-                """priority 필드 정규화"""
-                if "priority" in action:
-                    priority = action["priority"]
-                    if priority not in valid_priorities:
-                        # 유효하지 않은 priority를 기본값으로 변경
-                        if priority in ["보통", "낮음", "normal", "low"]:
-                            action["priority"] = "중요"
-                        elif priority in ["높음", "high", "urgent"]:
-                            action["priority"] = "긴급"
-                        else:
-                            action["priority"] = "중요"  # 기본값
-                else:
-                    action["priority"] = "중요"  # 기본값
-                return action
-            
-            # Pydantic model_validate로 최적화 (priority 정규화 후)
-            urgent_actions = [UrgentAction.model_validate(normalize_action(action)) for action in data.get("urgent_actions", [])]
-            this_week_actions = [UrgentAction.model_validate(normalize_action(action)) for action in data.get("this_week_actions", [])]
-            long_term_actions = [UrgentAction.model_validate(normalize_action(action)) for action in data.get("long_term_actions", [])]
-            
-            return ActionPlan(
-                urgent_actions=urgent_actions,
-                this_week_actions=this_week_actions,
-                long_term_actions=long_term_actions
-            )
+            return self._build_action_plan_from_dict(data)
         except Exception as exc:
             logger.error("Failed to generate action plan: %s", exc)
             return self._create_default_action_plan(analysis)
@@ -369,6 +431,345 @@ JSON 형식으로 응답 (각 카테고리 최대 3개):
                 "💬 \"혼자 있는 시간이 많아서 외로워요\"",
                 "💬 \"몸이 예전 같지 않아서 걱정이에요\""
             ]
+
+    async def _generate_caregiver_bundle(
+        self,
+        conversation: str,
+        comprehensive_analysis: ComprehensiveAnalysisResult,
+        image_analysis: Dict,
+        fact_snapshot: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """감성 인사이트, 행동 계획, 주요 걱정거리, 어머니 목소리를 한 번의 호출로 생성"""
+        summary = comprehensive_analysis.comprehensive_summary
+        emotion = comprehensive_analysis.emotion_analysis
+        risk = comprehensive_analysis.risk_analysis
+        anomaly = comprehensive_analysis.anomaly_analysis
+
+        image_concerns = []
+        if image_analysis.get("analysis"):
+            image_concerns = image_analysis["analysis"].get("concerns", [])
+        image_concern_text = ", ".join(image_concerns) if image_concerns else "없음"
+
+        trend_label = anomaly.pattern_type if anomaly.pattern_type != "없음" else anomaly.trend_analysis
+
+        fact_json = json.dumps(fact_snapshot, ensure_ascii=False)
+
+        convo_lines = [line.strip() for line in conversation.splitlines() if line.strip()]
+        trimmed_conversation = "\n".join(convo_lines[-20:])  # 최신 발언 위주 20줄
+
+        prompt = f"""
+당신은 독거노인 케어 전문가입니다. 다음 정보를 바탕으로 보호자용 보고서 요소를 한 번에 생성하세요.
+
+Facts 스냅샷:
+{fact_json}
+
+감정 점수: 긍정 {emotion.positive}/100, 불안 {emotion.anxiety}/100, 우울 {emotion.depression}/100, 외로움 {emotion.loneliness}/100
+전반 기분: {emotion.overall_mood}
+우선순위: {summary.priority_level}, 상태 요약: {summary.main_summary}
+위험도: {risk.risk_level}, 즉시 우려: {', '.join(risk.immediate_concerns) or '없음'}
+이미지 우려: {image_concern_text}
+추세/패턴: {trend_label}
+
+최근 대화 발췌:
+{trimmed_conversation}
+
+JSON 형식으로만 응답하세요:
+{{
+  "emotional_insights": {{
+    "headline": "<감성 요약 제목>",
+    "mood_description": "<기분 설명>",
+    "energy_level": "<활력 설명>",
+    "pain_level": "<신체 불편 설명>",
+    "emotional_state": "<전반 감정 상태>"
+  }},
+  "action_plan": {{
+    "urgent_actions": [
+      {{
+        "action_id": 1,
+        "priority": "최우선",
+        "icon": "📞",
+        "title": "제목",
+        "reason": "이유",
+        "detail": "실행 방법",
+        "deadline": "오늘",
+        "estimated_time": "10분",
+        "suggested_topics": ["예시"]
+      }}
+    ],
+    "this_week_actions": [],
+    "long_term_actions": []
+  }},
+  "mother_voice": ["💬 \"실제 인용\""],
+  "key_concerns": [
+    {{
+      "concern_id": 1,
+      "type": "건강|안전|정서|생활",
+      "icon": "🏥",
+      "severity": "urgent|caution|normal",
+      "title": "걱정 요약",
+      "description": "간결한 설명",
+      "detected_from": ["대화", "표정"],
+      "urgency_reason": "이 항목이 중요한 이유"
+    }}
+  ]
+}}
+
+규칙:
+- action_plan 항목은 최대 6개(긴급 2, 이번 주 3, 장기 1) 이내이며, 연락 방법을 중복하지 말고 다양하게 제안하세요 (전화, 음성 메시지, 영상 통화, 방문 예약, 복지센터 프로그램 등).
+- 우울/절망 징후가 강하면 concerns에 '우울증 우려', '자살 위험 의심' 등을 명시하고, action_plan에도 이에 대한 구체 조치를 포함하세요.
+- mother_voice에는 실제 대화 인용을 그대로 사용하고, 없으면 facts.notable_quotes에서 골라주세요.
+- key_concerns는 가장 중요한 3개까지, severity와 urgency_reason을 구체적으로 작성하세요.
+"""
+
+        bundle_schema = {
+            "name": "caregiver_bundle",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "emotional_insights": {
+                        "type": "object",
+                        "properties": {
+                            "headline": {"type": "string"},
+                            "mood_description": {"type": "string"},
+                            "energy_level": {"type": "string"},
+                            "pain_level": {"type": "string"},
+                            "emotional_state": {"type": "string"},
+                        },
+                        "required": ["headline", "mood_description", "energy_level", "pain_level", "emotional_state"],
+                        "additionalProperties": False,
+                    },
+                    "action_plan": {
+                        "type": "object",
+                        "properties": {
+                            "urgent_actions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "action_id": {"type": "integer"},
+                                        "priority": {"type": "string", "enum": ["최우선", "긴급", "중요"]},
+                                        "icon": {"type": "string"},
+                                        "title": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                        "detail": {"type": "string"},
+                                        "deadline": {"type": "string"},
+                                        "estimated_time": {"type": "string"},
+                                        "suggested_topics": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "maxItems": 4
+                                        }
+                                    },
+                                    "required": ["action_id", "priority", "icon", "title", "reason", "detail", "deadline", "estimated_time"],
+                                    "additionalProperties": False
+                                },
+                                "maxItems": 2
+                            },
+                            "this_week_actions": {
+                                "type": "array",
+                                "items": {"$ref": "#/$defs/action_item"},
+                                "maxItems": 3
+                            },
+                            "long_term_actions": {
+                                "type": "array",
+                                "items": {"$ref": "#/$defs/action_item"},
+                                "maxItems": 2
+                            }
+                        },
+                        "required": ["urgent_actions", "this_week_actions", "long_term_actions"],
+                        "additionalProperties": False
+                    },
+                    "mother_voice": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 4
+                    },
+                    "key_concerns": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "concern_id": {"type": "integer"},
+                                "type": {"type": "string", "enum": ["건강", "안전", "정서", "생활"]},
+                                "icon": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["urgent", "caution", "normal"]},
+                                "title": {"type": "string"},
+                                "description": {"type": "string"},
+                                "detected_from": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "maxItems": 3
+                                },
+                                "urgency_reason": {"type": "string"}
+                            },
+                            "required": ["concern_id", "type", "icon", "severity", "title", "description", "detected_from", "urgency_reason"],
+                            "additionalProperties": False
+                        },
+                        "maxItems": 3
+                    }
+                },
+                "required": ["emotional_insights", "action_plan", "mother_voice", "key_concerns"],
+                "additionalProperties": False,
+                "$defs": {
+                    "action_item": {
+                        "type": "object",
+                        "properties": {
+                            "action_id": {"type": "integer"},
+                            "priority": {"type": "string", "enum": ["최우선", "긴급", "중요"]},
+                            "icon": {"type": "string"},
+                            "title": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "detail": {"type": "string"},
+                            "deadline": {"type": "string"},
+                            "estimated_time": {"type": "string"},
+                            "suggested_topics": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 4
+                            }
+                        },
+                        "required": ["action_id", "priority", "icon", "title", "reason", "detail", "deadline", "estimated_time"],
+                        "additionalProperties": False
+                    }
+                }
+            }
+        }
+
+        try:
+            response = await self.analysis_service._call_openai(
+                prompt,
+                max_tokens=700,
+                task_name="_generate_caregiver_bundle",
+                timeout_seconds=8.0,
+                temperature=0.25,
+                response_format={"type": "json_schema", "json_schema": bundle_schema}
+            )
+            return json.loads(response)
+        except Exception as exc:
+            logger.error("Failed to generate caregiver bundle: %s", exc)
+            return None
+    
+    async def _run_legacy_caregiver_tasks(
+        self,
+        comprehensive_analysis: ComprehensiveAnalysisResult,
+        conversation: str,
+        image_analysis: Dict
+    ) -> Tuple[Dict[str, Any], ActionPlan, List[str], List[KeyConcern]]:
+        """기존 4분할 LLM 호출을 병렬로 실행"""
+        default_emotional = {
+            "headline": "어머니 상태를 확인이 필요합니다",
+            "mood_description": "평소보다 기분이 좋지 않으신 것 같아요",
+            "energy_level": "활력이 부족해 보입니다",
+            "pain_level": "몸이 불편하신 것 같아요",
+            "emotional_state": "관심과 돌봄이 필요한 상태입니다"
+        }
+        default_action_plan = self._create_default_action_plan(comprehensive_analysis)
+        default_mother_voice = [
+            "💬 \"요즘 컨디션이 별로 좋지 않아요\"",
+            "💬 \"혼자 있는 시간이 많아서 외로워요\"",
+            "💬 \"몸이 예전 같지 않아서 걱정이에요\""
+        ]
+        default_concerns = self._create_default_concerns(comprehensive_analysis)
+
+        async def safe_call(coro, timeout: float, label: str, default_value):
+            try:
+                return await asyncio.wait_for(coro, timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("%s failed/timeout: %s", label, exc)
+                return default_value
+
+        tasks = [
+            asyncio.create_task(
+                safe_call(
+                    self._generate_emotional_insights(conversation, comprehensive_analysis),
+                    10.0,
+                    "Emotional insights",
+                    default_emotional
+                ),
+                name="legacy_emotional_insights"
+            ),
+            asyncio.create_task(
+                safe_call(
+                    self._generate_actionable_plan(comprehensive_analysis, conversation),
+                    10.0,
+                    "Action plan",
+                    default_action_plan
+                ),
+                name="legacy_action_plan"
+            ),
+            asyncio.create_task(
+                safe_call(
+                    self._extract_mother_voice(conversation),
+                    10.0,
+                    "Mother voice",
+                    default_mother_voice
+                ),
+                name="legacy_mother_voice"
+            ),
+            asyncio.create_task(
+                safe_call(
+                    self._identify_key_concerns(comprehensive_analysis, conversation, image_analysis),
+                    10.0,
+                    "Key concerns",
+                    default_concerns
+                ),
+                name="legacy_key_concerns"
+            ),
+        ]
+
+        results = await asyncio.gather(*tasks)
+        emotional_insights = results[0]
+        action_plan = results[1]
+        mother_voice = results[2]
+        key_concerns = results[3]
+        return emotional_insights, action_plan, mother_voice, key_concerns
+
+    def _parse_bundle_result(
+        self,
+        bundle: Dict[str, Any],
+        comprehensive_analysis: ComprehensiveAnalysisResult
+    ) -> Tuple[Dict[str, Any], ActionPlan, List[str], List[KeyConcern]]:
+        emotional_insights = bundle.get("emotional_insights") or {}
+        if not emotional_insights:
+            emotional_insights = {
+                "headline": "어머니 상태를 확인이 필요합니다",
+                "mood_description": "평소보다 기분이 좋지 않으신 것 같아요",
+                "energy_level": "활력이 부족해 보입니다",
+                "pain_level": "몸이 불편하신 것 같아요",
+                "emotional_state": "관심과 돌봄이 필요한 상태입니다"
+            }
+
+        action_plan_data = bundle.get("action_plan") or {}
+        try:
+            action_plan = self._build_action_plan_from_dict(action_plan_data)
+        except Exception as exc:
+            logger.error("Failed to parse bundled action plan: %s", exc)
+            action_plan = self._create_default_action_plan(comprehensive_analysis)
+
+        mother_voice = bundle.get("mother_voice") or []
+        if not isinstance(mother_voice, list):
+            mother_voice = []
+        mother_voice = [str(item).strip() for item in mother_voice if str(item).strip()]
+        if not mother_voice:
+            mother_voice = [
+                "💬 \"요즘 컨디션이 별로 좋지 않아요\"",
+                "💬 \"혼자 있는 시간이 많아서 외로워요\"",
+                "💬 \"몸이 예전 같지 않아서 걱정이에요\""
+            ]
+
+        key_concerns_data = bundle.get("key_concerns") or []
+        parsed_concerns: List[KeyConcern] = []
+        for idx, concern in enumerate(key_concerns_data, start=1):
+            try:
+                normalized = self._normalize_concern_entry(concern, idx)
+                parsed_concerns.append(KeyConcern.model_validate(normalized))
+            except ValidationError as exc:
+                logger.error("Invalid concern item at %s: %s", idx, exc)
+        key_concerns = parsed_concerns or self._create_default_concerns(comprehensive_analysis)
+
+        return emotional_insights, action_plan, mother_voice, key_concerns
     
     async def _identify_key_concerns(
         self, 
@@ -410,11 +811,27 @@ JSON 형식 (간결하게):
         
         try:
             task_start = time.time()
-            # max_tokens를 500으로 줄임 (concerns는 보통 3-5개, 각각 100 tokens 정도면 충분)
-            response = await self.analysis_service._call_openai(prompt, max_tokens=500, task_name="_identify_key_concerns")
+            # max_tokens를 600으로 증가 (JSON 파싱 에러 방지, concerns는 보통 3-5개)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=600, task_name="_identify_key_concerns")
             task_time = time.time() - task_start
             print(f"[PERF] _identify_key_concerns API call: {task_time:.2f}s", flush=True)
             logger.debug(f"[PERF] _identify_key_concerns API call: {task_time:.2f}s")
+            
+            # JSON 파싱 전에 응답 확인 및 정리
+            response = response.strip()
+            # JSON 파싱 에러 방지를 위한 처리
+            if not response.startswith('{'):
+                # JSON 시작 부분 찾기
+                start_idx = response.find('{')
+                if start_idx > 0:
+                    response = response[start_idx:]
+            # JSON 끝 부분 정리
+            if not response.endswith('}'):
+                # 마지막 닫는 중괄호 찾기
+                last_idx = response.rfind('}')
+                if last_idx > 0:
+                    response = response[:last_idx+1]
+            
             data = json.loads(response)
             # Pydantic model_validate로 최적화
             return [KeyConcern.model_validate(concern) for concern in data.get("concerns", [])]
@@ -664,10 +1081,17 @@ JSON 형식 (간결하게):
         
         if not changes:
             # 유의미한 변화가 없으면 안정적 표시
+            mood_score = analysis.emotion_analysis.positive
+            alert_message = "지난 7일 대비 큰 변화 없음"
+            if mood_score <= 40:
+                alert_message = (
+                    f"{alert_message} — 현재 기분 점수는 {mood_score}/100으로 낮지만 "
+                    "지난 7일 동안 비슷한 수준이 유지되었습니다. 급격한 악화는 감지되지 않았습니다."
+                )
             return TrendAnalysis(
                 compared_to="지난 7일",
                 changes=[],
-                alert_message="지난 7일 대비 큰 변화 없음",
+                alert_message=alert_message,
                 pattern="안정적"
             )
         
@@ -702,20 +1126,42 @@ JSON 형식 (간결하게):
             )
         ]
         
-        cta_buttons = [
+        cta_buttons = []
+        if analysis.comprehensive_summary.priority_level in ["긴급", "높음"]:
+            cta_buttons.append(
+                CTAButton(
+                    text="지금 전화하기",
+                    icon="📞",
+                    color="#FF4444",
+                    action="call"
+                )
+            )
+        else:
+            cta_buttons.append(
+                CTAButton(
+                    text="짧은 안부 전화하기",
+                    icon="📞",
+                    color="#FF6666",
+                    action="call"
+                )
+            )
+
+        cta_buttons.append(
             CTAButton(
-                text="지금 전화하기",
-                icon="📞",
-                color="#FF4444",
-                action="call"
-            ),
+                text="음성 메시지 보내기",
+                icon="🎙️",
+                color="#FF8800",
+                action="send_voice_note"
+            )
+        )
+        cta_buttons.append(
             CTAButton(
                 text="영상 전체보기",
                 icon="🎬",
                 color="#4444FF",
                 action="watch_video"
             )
-        ]
+        )
         
         if analysis.comprehensive_summary.priority_level == "긴급":
             cta_buttons.append(CTAButton(
@@ -743,22 +1189,68 @@ JSON 형식 (간결하게):
                 action_id=1,
                 priority="최우선",
                 icon="📞",
-                title="어머니께 안부 전화 드리기",
-                reason="현재 상태 확인이 필요합니다",
-                detail="어머니가 연락을 기다리고 계실 수 있습니다",
+                title="어머니께 짧게 안부 전화 드리기",
+                reason="오늘 기분과 몸 상태를 직접 확인하면 안심하실 수 있습니다",
+                detail="5분 정도 통화하면서 현재 컨디션과 필요한 도움이 있는지 여쭤보세요",
                 deadline="오늘 중",
-                estimated_time="10-15분",
+                estimated_time="10분 이내",
                 suggested_topics=[
-                    "엄마 안 바빠요. 어디 불편하신 데 없으세요?",
-                    "식사는 잘 하세요? 제가 반찬 좀 가져다 드릴게요",
-                    "이번 주말에 갈게요. 뭔가 필요한 거 있으세요?"
+                    "지금 어디 불편하신 곳은 없는지 편하게 말씀해주세요",
+                    "식사나 약 챙기시는 데 도와드릴 일 있을까요?",
+                    "이번 주 후반에 제가 들를 수 있는데 괜찮으세요?"
+                ]
+            ),
+            UrgentAction(
+                action_id=2,
+                priority="긴급",
+                icon="🎥",
+                title="짧은 영상 통화 시간 잡기",
+                reason="얼굴을 보고 이야기하면 정서적 안정에 도움이 됩니다",
+                detail="늦지 않은 시간에 10분 정도 영상 통화를 제안해보세요",
+                deadline="오늘 중",
+                estimated_time="5-10분",
+                suggested_topics=[
+                    "얼굴 뵙고 바로 안부 여쭤보고 싶어요, 괜찮으세요?",
+                    "요즘 집안에 바뀐 점이나 도움이 필요하신 게 있는지 봐드릴게요",
+                    "다음에 함께 하고 싶은 활동 있으면 말씀해주세요"
+                ]
+            ),
+        ]
+        
+        this_week_actions = [
+            UrgentAction(
+                action_id=3,
+                priority="중요",
+                icon="🎙️",
+                title="음성 메시지로 응원 남기기",
+                reason="통화가 어려운 날에도 꾸준한 정서적 연결을 유지할 수 있습니다",
+                detail="오늘 들은 이야기나 응원의 말을 짧게 녹음해 보내주세요",
+                deadline="이번 주",
+                estimated_time="5분",
+                suggested_topics=[
+                    "오늘 있었던 기분 좋은 일이나 감사 인사를 전해주세요",
+                    "어머니께서 좋아하시는 노래 한 소절을 불러드려도 좋아요"
+                ]
+            ),
+            UrgentAction(
+                action_id=4,
+                priority="중요",
+                icon="🚶",
+                title="근처 복지센터 산책 프로그램 문의하기",
+                reason="규칙적인 외출과 사회적 교류는 기분 회복에 큰 도움이 됩니다",
+                detail="어머니와 함께 참여할 수 있는 가벼운 산책 또는 운동 프로그램을 알아보세요",
+                deadline="이번 주",
+                estimated_time="20분",
+                suggested_topics=[
+                    "날씨 좋은 날 같이 걸을 수 있는 프로그램이 있는지 확인해보세요",
+                    "참여 시 필요한 준비물이나 일정도 함께 정리해주세요"
                 ]
             )
         ]
         
         return ActionPlan(
             urgent_actions=urgent_actions,
-            this_week_actions=[],
+            this_week_actions=this_week_actions,
             long_term_actions=[]
         )
     

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel, HttpUrl, Field
 
 from app.analyze.service import AnalyzeService
-from app.services.caregiver_service import CaregiverService
+from app.services.fast_analysis_service import FastAnalysisService
 from app.models.caregiver_models import CaregiverFriendlyResponse
 
 logger = logging.getLogger(__name__)
@@ -18,10 +18,10 @@ except Exception as exc:  # pragma: no cover - defensive
     analyze_service = None
 
 try:
-    caregiver_service = CaregiverService()
+    fast_analysis_service = FastAnalysisService()
 except Exception as exc:
-    logger.error("Failed to initialise CaregiverService: %s", exc)
-    caregiver_service = None
+    logger.error("Failed to initialise FastAnalysisService: %s", exc)
+    fast_analysis_service = None
 
 
 class AnalyzeRequest(BaseModel):
@@ -31,39 +31,39 @@ class AnalyzeRequest(BaseModel):
     audio_url: HttpUrl = Field(..., description="S3 음성 데이터 URL")
 
 
-@router.post("/", summary="상담 세션 분석 (S3 URL)")
-async def analyze_session(request: AnalyzeRequest):
-    if not analyze_service:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="분석 서비스가 초기화되지 않았습니다.",
-        )
+# @router.post("/", summary="상담 세션 분석 (S3 URL)")
+# async def analyze_session(request: AnalyzeRequest):
+#     if not analyze_service:
+#         raise HTTPException(
+#             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+#             detail="분석 서비스가 초기화되지 않았습니다.",
+#         )
+#
+#     try:
+#         shout_result = await analyze_service.detect_shout_from_url(str(request.audio_url))
+#     except ValueError as exc:
+#         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+#     except RuntimeError as exc:
+#         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+#
+#     return {
+#         "success": True,
+#         "session_id": request.session_id,
+#         "user_id": request.user_id,
+#         "conversation": request.conversation,
+#         "audio_url": str(request.audio_url),
+#         "shout_detection": shout_result,
+#     }
 
-    try:
-        shout_result = await analyze_service.detect_shout_from_url(str(request.audio_url))
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
-    return {
-        "success": True,
-        "session_id": request.session_id,
-        "user_id": request.user_id,
-        "conversation": request.conversation,
-        "audio_url": str(request.audio_url),
-        "shout_detection": shout_result,
-    }
-
-
-@router.post("/upload", summary="영상 편지 종합 분석 (보호자 친화적)", response_model=CaregiverFriendlyResponse)
+@router.post("/upload", summary="다 끝나고 보내는 엔드포인트", response_model=CaregiverFriendlyResponse)
 async def analyze_session_with_upload(
     session_id: str = Form(...),
     user_id: str = Form(...),
     conversation: str = Form(..., description="AI 질문과 노인 응답이 포함된 대화 내용"),
     audio_file: UploadFile = File(...),
 ):
-    if not analyze_service or not caregiver_service:
+    if not analyze_service or not fast_analysis_service:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="분석 서비스가 초기화되지 않았습니다.",
@@ -83,8 +83,8 @@ async def analyze_session_with_upload(
         # image_analysis = get_image_analysis_by_session_id(session_id)
         image_analysis = _get_dummy_image_analysis(session_id)
         
-        # 보호자 친화적 종합 리포트 생성
-        caregiver_report = await caregiver_service.generate_caregiver_friendly_report(
+        # 🚀 초고속 보호자 친화적 리포트 생성 (12초 미만 목표)
+        caregiver_report = await fast_analysis_service.generate_ultra_fast_report(
             conversation=conversation,
             image_analysis=image_analysis,
             audio_analysis=upload_result,

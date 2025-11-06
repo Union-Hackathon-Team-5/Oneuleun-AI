@@ -39,21 +39,44 @@ class AnalysisService:
             timeout = httpx.Timeout(15.0, connect=5.0)  # 총 15초, 연결 5초
             self._client = httpx.AsyncClient(timeout=timeout, limits=limits)
         return self._client
+
+    @staticmethod
+    def _trim_conversation(conversation: str, max_chars: int = 1600) -> str:
+        """대화 전문이 너무 길면 앞/뒤 요약으로 압축"""
+        text = conversation.strip()
+        if len(text) <= max_chars:
+            return text
+
+        head_keep = max_chars // 3
+        tail_keep = max_chars - head_keep - 100  # 중간 생략 안내 공간
+        head = text[:head_keep].rstrip()
+        tail = text[-tail_keep:].lstrip()
+        return f"{head}\n...\n(중략)\n...\n{tail}"
     
-    async def _call_openai(self, prompt: str, max_tokens: int = 800, task_name: str = "unknown", timeout_seconds: float = 15.0) -> str:
+    async def _call_openai(
+        self,
+        prompt: str,
+        max_tokens: int = 800,
+        task_name: str = "unknown",
+        timeout_seconds: float = 15.0,
+        temperature: float = 0.1,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """OpenAI API 호출 (JSON 형식 강제, 최적화, 타임아웃 적용)"""
         call_start = time.time()
         print(f"[PERF] Starting API call: {task_name} (tokens: {max_tokens})", flush=True)
         
+        format_payload = response_format or {"type": "json_object"}
+
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": "당신은 노인 복지 전문 AI 분석사입니다. 반드시 유효한 JSON 형식으로만 응답해주세요."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.1,
+            "temperature": temperature,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"}
+            "response_format": format_payload
         }
         
         headers = {
@@ -395,16 +418,157 @@ class AnalysisService:
                 monitoring_recommendations=[],
                 baseline_comparisons=[]
             )
-    
+
+    async def analyze_content_risk_bundle(
+        self,
+        conversation: str,
+        image_analysis: Optional[Dict] = None,
+        historical_data: Optional[List[Dict]] = None,
+    ) -> Tuple[ContentAnalysis, RiskAnalysis, AnomalyAnalysis, Dict[str, Any]]:
+        """대화 내용, 위험 신호, 이상 패턴을 한 번에 분석하고 facts 스냅샷을 반환"""
+        image_lines: List[str] = []
+        if image_analysis and "analysis" in image_analysis:
+            img_data = image_analysis["analysis"]
+            emotions = ", ".join(img_data.get("emotion", []))
+            summary = img_data.get("summary", "")
+            concerns = ", ".join(img_data.get("concerns", []))
+            if emotions:
+                image_lines.append(f"표정 감정: {emotions}")
+            if summary:
+                image_lines.append(f"요약: {summary}")
+            if concerns:
+                image_lines.append(f"우려: {concerns}")
+        image_summary = "\n".join(image_lines) if image_lines else "이미지 기반 우려 없음"
+
+        history_lines: List[str] = []
+        if historical_data:
+            for entry in historical_data[-3:]:
+                recorded = entry.get("recorded_at") or entry.get("date") or entry.get("timestamp")
+                positive = entry.get("positive")
+                depression = entry.get("depression")
+                mood = entry.get("overall_mood")
+                parts = []
+                if recorded:
+                    parts.append(str(recorded))
+                if positive is not None:
+                    parts.append(f"긍정 {positive}")
+                if depression is not None:
+                    parts.append(f"우울 {depression}")
+                if mood:
+                    parts.append(f"기분 {mood}")
+                if parts:
+                    history_lines.append(", ".join(parts))
+        history_summary = "\n".join(history_lines) if history_lines else "최근 기록 요약 없음"
+
+        trimmed_conversation = self._trim_conversation(conversation, max_chars=1400)
+
+        prompt = f"""
+다음 정보를 기반으로 보호자에게 필요한 핵심 사실을 구조화된 JSON으로만 추출하세요. 불필요한 서술이나 설명은 금지합니다.
+
+대화 요약용 발췌:
+{trimmed_conversation}
+
+이미지 분석 요약:
+{image_summary}
+
+최근 기록 요약:
+{history_summary}
+
+아래 JSON 스키마에 맞춰 응답하세요. 문자열은 120자 이하로 유지하고 중복 표현을 피하세요.
+{{
+  "facts": {{
+    "summary": "<200자 이하 핵심 요약>",
+    "notable_quotes": ["<걱정되는 직접 인용 최대 3개>"],
+    "symptoms": ["<신체·정서 증상 키워드>"],
+    "support_signals": ["<가족이 참고할 긍정 신호>"],
+    "risk_flags": ["<즉시 주의 징후>"]
+  }},
+  "content": {{
+    "summary": "<ContentAnalysis.summary>",
+    "main_topics": [],
+    "daily_activities": [],
+    "social_interactions": [],
+    "health_mentions": [],
+    "mood_indicators": []
+  }},
+  "risk": {{
+    "risk_level": "<안전|보통|주의|긴급>",
+    "detected_keywords": [],
+    "risk_categories": {{
+      "health": [],
+      "safety": [],
+      "mental": [],
+      "social": []
+    }},
+    "immediate_concerns": [],
+    "recommended_actions": []
+  }},
+  "anomaly": {{
+    "pattern_detected": <true|false>,
+    "pattern_type": "<급격한하락|지속적하락|행동변화|언어패턴변화|없음>",
+    "severity": "<심각|보통|경미>",
+    "trend_analysis": "<한 문장 설명>",
+    "comparison_notes": "<baseline 비교 설명>",
+    "alert_needed": <true|false>,
+    "monitoring_recommendations": []
+  }}
+}}
+
+규칙:
+- facts는 400 토큰 이내로 유지하고 중복 표현을 피합니다.
+- risk.immediate_concerns와 recommended_actions는 최대 3개씩만 포함합니다.
+- 우울증/자살 우려가 감지되면 risk.risk_categories.mental과 facts.risk_flags에 명확히 기록합니다.
+"""
+
+        try:
+            response = await self._call_openai(
+                prompt,
+                max_tokens=750,
+                task_name="content_risk_bundle",
+                temperature=0.2
+            )
+            bundle = json.loads(response)
+
+            facts = bundle.get("facts") or {}
+            content_data = bundle.get("content") or {}
+            risk_data = bundle.get("risk") or {}
+            anomaly_data = bundle.get("anomaly") or {}
+
+            content = ContentAnalysis.model_validate(content_data)
+            risk = RiskAnalysis.model_validate(risk_data)
+            anomaly = AnomalyAnalysis.model_validate(anomaly_data)
+
+            normalized_facts = {
+                "summary": facts.get("summary", ""),
+                "notable_quotes": facts.get("notable_quotes", []),
+                "symptoms": facts.get("symptoms", []),
+                "support_signals": facts.get("support_signals", []),
+                "risk_flags": facts.get("risk_flags", []),
+            }
+            return content, risk, anomaly, normalized_facts
+        except Exception as exc:
+            logger.error("Failed to analyze content_risk_bundle: %s", exc)
+            content = await self.analyze_conversation_content(conversation)
+            risk = await self.detect_risk_keywords(conversation, image_analysis)
+            anomaly = await self.detect_anomaly_patterns(conversation, historical_data)
+            fallback_facts = {
+                "summary": content.summary,
+                "notable_quotes": [],
+                "symptoms": risk.risk_categories.health + risk.risk_categories.mental,
+                "support_signals": [],
+                "risk_flags": risk.immediate_concerns,
+            }
+            return content, risk, anomaly, fallback_facts
+
     async def analyze_video_letter_comprehensive(
         self, 
         conversation: str, 
         historical_data: Optional[List[Dict]] = None,
         image_analysis: Optional[Dict] = None
-    ) -> ComprehensiveAnalysisResult:
-        """영상 편지 종합 분석 (병렬 처리, 타임아웃 최적화)"""
-        print(f"[PERF] Starting analyze_video_letter_comprehensive (4 parallel tasks)", flush=True)
-        logger.info("[PERF] Starting analyze_video_letter_comprehensive (4 parallel tasks)")
+    ) -> Tuple[ComprehensiveAnalysisResult, Dict[str, Any]]:
+        """영상 편지 종합 분석 (2개 병렬 작업으로 최적화)"""
+        print(f"[PERF] Starting analyze_video_letter_comprehensive (2 parallel tasks)", flush=True)
+        logger.info("[PERF] Starting analyze_video_letter_comprehensive (2 parallel tasks)")
         parallel_start = time.time()
         
         # 각 작업에 개별 타임아웃 적용 (15초)
@@ -421,56 +585,52 @@ class AnalysisService:
                     overall_mood="보통", emotional_summary="분석 실패"
                 )
         
-        async def content_with_timeout():
+        async def bundle_with_timeout():
             try:
                 return await asyncio.wait_for(
-                    self.analyze_conversation_content(conversation),
+                    self.analyze_content_risk_bundle(
+                        conversation,
+                        image_analysis=image_analysis,
+                        historical_data=historical_data,
+                    ),
                     timeout=15.0
                 )
             except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Content analysis failed/timeout: {exc}")
-                return ContentAnalysis(summary="분석 실패")
-        
-        async def risk_with_timeout():
-            try:
-                return await asyncio.wait_for(
-                    self.detect_risk_keywords(conversation, image_analysis),
-                    timeout=15.0
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Risk analysis failed/timeout: {exc}")
+                logger.error(f"Content/risk bundle failed/timeout: {exc}")
+                content = ContentAnalysis(summary="분석 실패")
                 from app.models.analysis_models import RiskCategories
-                return RiskAnalysis(
-                    risk_level="보통", detected_keywords=[], 
-                    risk_categories=RiskCategories()
+                risk = RiskAnalysis(risk_level="보통", detected_keywords=[], risk_categories=RiskCategories())
+                anomaly = AnomalyAnalysis(
+                    pattern_detected=False,
+                    pattern_type="없음",
+                    severity="경미",
+                    trend_analysis="분석 실패",
+                    comparison_notes="데이터 부족",
+                    alert_needed=False,
+                    monitoring_recommendations=[],
+                    baseline_comparisons=[]
                 )
-        
-        async def anomaly_with_timeout():
-            try:
-                return await asyncio.wait_for(
-                    self.detect_anomaly_patterns(conversation, historical_data),
-                    timeout=15.0
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.error(f"Anomaly analysis failed/timeout: {exc}")
-                return AnomalyAnalysis(
-                    pattern_detected=False, pattern_type="없음", severity="경미",
-                    trend_analysis="분석 실패", comparison_notes="과거 데이터 부족",
-                    alert_needed=False
-                )
+                facts = {
+                    "summary": content.summary,
+                    "notable_quotes": [],
+                    "symptoms": [],
+                    "support_signals": [],
+                    "risk_flags": [],
+                }
+                return content, risk, anomaly, facts
         
         try:
             # 모든 분석 결과를 병렬로 기다림 (각각 최대 15초)
-            emotion_result, content_result, risk_result, anomaly_result = await asyncio.gather(
+            emotion_result, bundle_result = await asyncio.gather(
                 emotion_with_timeout(),
-                content_with_timeout(),
-                risk_with_timeout(),
-                anomaly_with_timeout(),
+                bundle_with_timeout(),
                 return_exceptions=False  # 이미 타임아웃 처리됨
             )
             parallel_time = time.time() - parallel_start
             print(f"[PERF] Parallel analysis completed in {parallel_time:.2f}s", flush=True)
             logger.info(f"[PERF] Parallel analysis completed in {parallel_time:.2f}s")
+
+            content_result, risk_result, anomaly_result, fact_snapshot = bundle_result
             
             # baseline 비교 계산 (historical_data가 있는 경우)
             baseline_comparisons = []
@@ -490,7 +650,7 @@ class AnalysisService:
                 risk_analysis=risk_result,
                 anomaly_analysis=anomaly_result,
                 comprehensive_summary=comprehensive_result
-            )
+            ), fact_snapshot
             
         except Exception as exc:
             logger.error("Comprehensive analysis failed: %s", exc)

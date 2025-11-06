@@ -25,33 +25,33 @@ except ValueError as exc:
     s3_uploader = None
 
 
-@router.post("/")
-async def analyze_context(request: ContextRequest):
-    if not vision_service:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="분석 서비스가 초기화되지 않았습니다. OPENAI_API_KEY를 확인해주세요."
-        )
+# @router.post("/")
+# async def analyze_context(request: ContextRequest):
+#     if not vision_service:
+#         raise HTTPException(
+#             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+#             detail="분석 서비스가 초기화되지 않았습니다. OPENAI_API_KEY를 확인해주세요."
+#         )
+#
+#     try:
+#         analysis = await vision_service.analyze_emotion(request.photo_url)
+#         analysis = dict(analysis)
+#     except ValueError as exc:
+#         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+#     except RuntimeError as exc:
+#         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+#
+#     return {
+#         "success": True,
+#         "session_id": request.session_id,
+#         "user_id": request.user_id,
+#         "photo_url": request.photo_url,
+#         "analysis": analysis,
+#         "emotion_labels": EMOTION_LABELS,
+#     }
+#
 
-    try:
-        analysis = await vision_service.analyze_emotion(request.photo_url)
-        analysis = dict(analysis)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-
-    return {
-        "success": True,
-        "session_id": request.session_id,
-        "user_id": request.user_id,
-        "photo_url": request.photo_url,
-        "analysis": analysis,
-        "emotion_labels": EMOTION_LABELS,
-    }
-
-
-@router.post("/upload", summary="노인 감정 분석 (이미지 업로드)")
+@router.post("/upload", summary="상담 중 5초에 한번씩 보내는 엔드포인트")
 async def analyze_context_upload(
     session_id: str = Form(...),
     user_id: str = Form(...),
