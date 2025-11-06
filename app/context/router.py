@@ -2,7 +2,7 @@ import logging
 from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
 
 from app.context.request.ContextRequest import ContextRequest
-from app.context.services.vision_service import VisionService, BASE_EMOTIONS, EXTENDED_EMOTIONS, WARNING_SIGNS
+from app.context.services.vision_service import VisionService, EMOTION_LABELS
 from app.analyze.s3_service import S3Uploader
 
 logger = logging.getLogger(__name__)
@@ -25,31 +25,6 @@ except ValueError as exc:
     s3_uploader = None
 
 
-def _enrich_confidence(analysis: dict) -> dict:
-    value = analysis.get("confidence")
-    try:
-        score = int(round(float(value)))
-    except (TypeError, ValueError):
-        score = 0
-
-    score = max(0, min(100, score))
-    analysis["confidence"] = score
-
-    if score >= 75:
-        level = "높음"
-        comment = "모델이 감정 분류에 대해 상당한 확신을 갖고 있습니다."
-    elif score >= 40:
-        level = "보통"
-        comment = "감정 분류가 비교적 안정적이지만 추가 확인이 도움이 될 수 있습니다."
-    else:
-        level = "낮음"
-        comment = "감정 분류 확신이 낮으므로 다른 단서를 함께 참고하세요."
-
-    analysis["confidence_level"] = level
-    analysis["confidence_comment"] = comment
-    return analysis
-
-
 @router.post("/")
 async def analyze_context(request: ContextRequest):
     if not vision_service:
@@ -60,7 +35,7 @@ async def analyze_context(request: ContextRequest):
 
     try:
         analysis = await vision_service.analyze_emotion(request.photo_url)
-        analysis = _enrich_confidence(dict(analysis))
+        analysis = dict(analysis)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -72,11 +47,7 @@ async def analyze_context(request: ContextRequest):
         "user_id": request.user_id,
         "photo_url": request.photo_url,
         "analysis": analysis,
-        "categories": {
-            "base_emotions": BASE_EMOTIONS,
-            "extended_emotions": EXTENDED_EMOTIONS,
-            "warning_signs": WARNING_SIGNS,
-        },
+        "emotion_labels": EMOTION_LABELS,
     }
 
 
@@ -120,7 +91,7 @@ async def analyze_context_upload(
         )
         image_url = s3_uploader.build_public_url(key)
         analysis = await vision_service.analyze_emotion(image_url)
-        analysis = _enrich_confidence(dict(analysis))
+        analysis = dict(analysis)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -138,9 +109,6 @@ async def analyze_context_upload(
         "user_id": user_id,
         "photo_url": image_url,
         "analysis": analysis,
-        "categories": {
-            "base_emotions": BASE_EMOTIONS,
-            "extended_emotions": EXTENDED_EMOTIONS,
-            "warning_signs": WARNING_SIGNS,
-        },
+        "emotion_labels": EMOTION_LABELS,
     }
+

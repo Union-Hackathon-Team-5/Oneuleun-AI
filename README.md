@@ -32,7 +32,7 @@ docker compose up --build
 
 - `POST /context/`  
   요청 바디: `session_id`, `user_id`, `photo_url`  
-  응답: 기본 감정 7종, 확장 정서 8종, 위험 징후 6종 중 해당 항목과 신뢰도/요약을 포함한 JSON
+  응답: 감정 후보 6종(기쁨, 분노, 슬픔, 외로움, 무기력함, 행복) 중 하나를 선택하여 신뢰도와 요약을 반환합니다.
 - `POST /context/upload`  
   폼 데이터: `session_id`, `user_id`, `image_file`  
   업로드된 이미지를 `oneuld/image/<session_id>/...` 경로로 저장하고 감정 분석 결과를 반환합니다.
@@ -64,19 +64,13 @@ curl -X POST "http://localhost:8000/context/" \
   "user_id": "elderly_001",
   "photo_url": "https://example-bucket.s3.ap-northeast-2.amazonaws.com/sessions/123/snapshot_001.jpg",
   "analysis": {
-    "base_emotion": "기쁨",
-    "extended_emotion": "만족",
-    "warning_signs": [],
+    "emotion": "기쁨",
     "confidence": 82,
     "confidence_level": "높음",
     "confidence_comment": "모델이 감정 분류에 대해 상당한 확신을 갖고 있습니다.",
     "summary": "잔잔한 미소와 안정된 표정이 관찰됩니다."
   },
-  "categories": {
-    "base_emotions": ["기쁨", "슬픔", "분노", "놀람", "공포", "혐오", "중립"],
-    "extended_emotions": ["평온", "우울", "피로", "외로움", "불안", "긴장", "만족", "무기력"],
-    "warning_signs": ["통증", "혼미", "호흡곤란", "장기침묵", "자책발언", "사회고립"]
-  }
+  "emotion_labels": ["기쁨", "분노", "슬픔", "외로움", "무기력함", "행복"]
 }
 ```
 

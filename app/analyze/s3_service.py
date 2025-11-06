@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +13,8 @@ logger = logging.getLogger(__name__)
 class S3Uploader:
     """
     Lightweight helper for uploading media into S3 with configurable prefixes.
-    Objects are written with public-read ACL to support direct access by OpenAI.
+    Attempts to apply the ACL configured via S3_OBJECT_ACL (default public-read) but
+    will fall back to bucket defaults when ACLs are disallowed.
     """
 
     def __init__(self):
@@ -21,6 +23,7 @@ class S3Uploader:
         region = os.getenv("AWS_REGION")
         bucket = os.getenv("S3_BUCKET_NAME")
         public_base = os.getenv("S3_PUBLIC_BASE")
+        object_acl_env = os.getenv("S3_OBJECT_ACL", "public-read")
 
         if not all([access_key, secret_key, region, bucket, public_base]):
             raise ValueError(
@@ -30,6 +33,10 @@ class S3Uploader:
         self.bucket = bucket
         self.region = region
         self.public_base = public_base.rstrip("/")
+        normalized_acl = (object_acl_env or "").strip().lower()
+        if normalized_acl in {"", "none", "disabled", "off"}:
+            normalized_acl = ""
+        self.object_acl = normalized_acl or None
         self.client = boto3.client(
             "s3",
             aws_access_key_id=access_key,
@@ -58,17 +65,47 @@ class S3Uploader:
 
         key = f"{normalized_prefix.rstrip('/')}/{session_id}/{uuid.uuid4().hex}{ext}"
 
-        extra_args = {"ACL": "public-read"}
+        extra_args = {}
         if content_type:
             extra_args["ContentType"] = content_type
 
-        self.client.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=content,
-            **extra_args,
-        )
-        logger.info("Uploaded media to s3://%s/%s (public-read)", self.bucket, key)
+        def put_object(include_acl: bool) -> None:
+            call_args = dict(extra_args)
+            if include_acl and self.object_acl:
+                call_args["ACL"] = self.object_acl
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=content,
+                **call_args,
+            )
+
+        try:
+            put_object(include_acl=bool(self.object_acl))
+        except ClientError as error:
+            error_code = error.response.get("Error", {}).get("Code")
+            if (
+                self.object_acl
+                and error_code == "AccessControlListNotSupported"
+            ):
+                logger.warning(
+                    "Bucket %s does not support ACL '%s'; retrying without ACL",
+                    self.bucket,
+                    self.object_acl,
+                )
+                put_object(include_acl=False)
+            else:
+                raise
+
+        if self.object_acl:
+            logger.info(
+                "Uploaded media to s3://%s/%s with ACL %s",
+                self.bucket,
+                key,
+                self.object_acl,
+            )
+        else:
+            logger.info("Uploaded media to s3://%s/%s", self.bucket, key)
         return key
 
     def upload_audio(

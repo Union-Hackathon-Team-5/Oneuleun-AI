@@ -7,13 +7,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-BASE_EMOTIONS: List[str] = ["기쁨", "슬픔", "분노", "놀람", "공포", "혐오", "중립"]
-EXTENDED_EMOTIONS: List[str] = ["평온", "우울", "피로", "외로움", "불안", "긴장", "만족", "무기력"]
-WARNING_SIGNS: List[str] = ["통증", "혼미", "호흡곤란", "장기침묵", "자책발언", "사회고립"]
-ALL_EMOTION_LABELS: List[str] = BASE_EMOTIONS + EXTENDED_EMOTIONS + WARNING_SIGNS
+EMOTION_LABELS: List[str] = ["기쁨", "분노", "슬픔", "외로움", "무기력함", "행복"]
 
-logger.info("Loaded emotion labels: %s", ALL_EMOTION_LABELS)
-print(f"[ContextEmotionLabels] {ALL_EMOTION_LABELS}", flush=True)
+logger.info("Loaded emotion labels: %s", EMOTION_LABELS)
+print(f"[ContextEmotionLabels] {EMOTION_LABELS}", flush=True)
 
 
 class VisionService:
@@ -92,23 +89,21 @@ class VisionService:
             raise RuntimeError("OpenAI 분석 요청 중 오류가 발생했습니다.") from exc
 
     def _build_prompt(self) -> str:
+        label_text = ", ".join(EMOTION_LABELS)
         return (
-            "다음 노인 분의 표정과 전반 상황을 살펴보고 감정을 분류해주세요.\n"
-            "1) 기본 감정 7가지 중 하나를 선택하세요: "
-            f"{', '.join(BASE_EMOTIONS)}\n"
-            "2) 확장 정서 8가지 중 하나를 선택하세요: "
-            f"{', '.join(EXTENDED_EMOTIONS)}\n"
-            "3) 위험 징후 6가지에서 해당되는 항목이 있으면 모두 나열하세요: "
-            f"{', '.join(WARNING_SIGNS)} (없다면 빈 배열)\n\n"
+            "다음 노인 분의 표정과 전반 상황을 면밀히 살펴본 뒤 감정을 분석해주세요.\n"
+            f"가능한 감정 라벨은 다음 목록에서만 선택하세요: {label_text}\n\n"
             "다음 JSON 형식으로만 답변하세요:\n"
             "{\n"
-            '  "base_emotion": "<기본 감정 1개>",\n'
-            '  "extended_emotion": "<확장 정서 1개>",\n'
-            '  "warning_signs": ["<위험 징후 또는 빈 배열>"],\n'
-            '  "confidence": <0~100 숫자>,\n'
-            '  "summary": "<짧은 한 줄 설명>"\n'
+            '  "emotion": ["<감정 키워드 1개 또는 2개>"],\n'
+            '  "summary": "<짧은 한 줄 설명>",\n'
+            '  "concerns": ["<이미지 속에서 관찰되는 우려 사항 목록 (없으면 빈 배열)>"]\n'
             "}\n"
-            "선택지는 반드시 위에서 제시한 단어만 사용하세요."
+            "concerns 항목에는 노인의 상태나 환경에서 주의가 필요한 점이 있다면 최대한 구체적으로 작성하세요.\n"
+            "특히 극심한 좌절·절망, 무기력함, 생명에 대한 위험 신호가 포착되면 각각 '우울증 우려', '자살 위험 의심'과 같은 표현을 포함하세요.\n"
+            "추가로 식사 거부 징후, 낙상 위험, 안전하지 않은 생활 환경 등이 보이면 구체적으로 서술하세요.\n"
+            "특별한 우려가 없으면 concerns 는 빈 배열 []을 넣으세요.\n"
+            "emotion 배열에는 감정 라벨을 최대 2개까지 넣되, 첫 번째 요소가 가장 가능성이 높은 감정이 되도록 하세요."
         )
 
     def _extract_text(self, response: Dict[str, Any]) -> str:
@@ -128,17 +123,40 @@ class VisionService:
         return "".join(chunks).strip()
 
     def _validate_response(self, data: Dict[str, Any]) -> None:
-        base = data.get("base_emotion")
-        extended = data.get("extended_emotion")
-        warnings = data.get("warning_signs", [])
+        emotion_value = data.get("emotion")
+        if isinstance(emotion_value, str):
+            emotion_list = [emotion_value]
+        elif isinstance(emotion_value, list):
+            emotion_list = emotion_value
+        else:
+            raise ValueError("감정 레이블은 리스트 형식이어야 합니다.")
 
-        if base not in BASE_EMOTIONS:
-            raise ValueError("기본 감정이 올바르지 않습니다.")
-        if extended not in EXTENDED_EMOTIONS:
-            raise ValueError("확장 정서가 올바르지 않습니다.")
-        if not isinstance(warnings, list):
-            raise ValueError("warning_signs 항목은 배열이어야 합니다.")
+        if not emotion_list:
+            raise ValueError("최소 하나의 감정 레이블이 필요합니다.")
 
-        for sign in warnings:
-            if sign not in WARNING_SIGNS:
-                raise ValueError(f"지원하지 않는 위험 징후: {sign}")
+        invalid_labels = [label for label in emotion_list if label not in EMOTION_LABELS]
+        if invalid_labels:
+            raise ValueError("감정 레이블이 허용된 목록에 없습니다.")
+
+        data["emotion"] = emotion_list
+
+        summary = data.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("요약 문장은 비어 있을 수 없습니다.")
+
+        concerns = data.get("concerns")
+        if concerns is None:
+            data["concerns"] = []
+        elif isinstance(concerns, str):
+            data["concerns"] = [concerns] if concerns.strip() else []
+        elif isinstance(concerns, list):
+            normalized_concerns = []
+            for item in concerns:
+                if not isinstance(item, str):
+                    raise ValueError("concerns 항목은 문자열이어야 합니다.")
+                stripped = item.strip()
+                if stripped:
+                    normalized_concerns.append(stripped)
+            data["concerns"] = normalized_concerns
+        else:
+            raise ValueError("concerns 항목은 리스트 또는 문자열이어야 합니다.")
