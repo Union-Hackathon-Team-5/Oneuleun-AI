@@ -36,6 +36,7 @@ async def analyze_session_with_upload(request: AnalyzeUploadRequest):
             conversation=request.conversation,
             session_id=request.session_id,
             user_id=request.user_id,
+            senior_name=request.senior_name,
         )
         return AnalyzeUploadResponse.model_validate(llm_payload)
     except ValidationError as exc:

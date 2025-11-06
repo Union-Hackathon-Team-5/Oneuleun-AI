@@ -182,18 +182,21 @@ class FastAnalysisService:
         conversation: str,
         session_id: str,
         user_id: str,
+        senior_name: str,
     ) -> Dict[str, Any]:
         """간소화된 보호자 리포트 생성 (LLM 기반, 병렬 섹션 구성)"""
         start_time = time.time()
         logger.info(
-            "[LLM] Segmented caregiver report start (session_id=%s, user_id=%s)",
+            "[LLM] Segmented caregiver report start (session_id=%s, user_id=%s, senior_name=%s)",
             session_id,
             user_id,
+            senior_name,
         )
         compressed_conversation = self._compress_conversation(conversation)
         base_context = (
             f"세션 ID: {session_id}\n"
             f"사용자 ID: {user_id}\n"
+            f"노인 이름: {senior_name}\n"
             "대화 요약:\n"
             f'"""\n{compressed_conversation}\n"""'
         )
@@ -203,7 +206,7 @@ class FastAnalysisService:
             "역할: 노인 케어 전문가.\n"
             "JSON 객체 하나를 반환하고 키는 health, emotion, daily_function, summary 입니다.\n"
             "health, emotion, daily_function 값은 red, yellow, green 중 하나로 지정하세요.\n"
-            "summary는 한국어 한 문장으로 현재 상태를 요약하세요.\n"
+            "summary는 한국어 한 문장으로 현재 상태를 요약하고, 반드시 노인의 이름을 포함하세요 (예: \"OOO님\").\n"
             "정보가 명확하지 않으면 건강 관련 값은 'red', 감정과 일상 기능은 'yellow'로 설정하세요."
         )
 
@@ -212,7 +215,7 @@ class FastAnalysisService:
             "역할: 대화 핵심 문장 추출기.\n"
             "JSON 객체 하나만 출력하고 키는 key_phrases 입니다.\n"
             "key_phrases 값은 대화에서 가장 중요한 발화를 3~5개 담은 배열이어야 합니다.\n"
-            "각 항목은 말한 사람의 감정이 드러나도록 한국어 자연 문장으로 작성하세요."
+            "각 항목은 말한 사람의 감정이 드러나도록 한국어 자연 문장으로 작성하고, 문맥상 필요한 경우 노인 이름을 명시하세요."
         )
 
         care_todo_prompt = (
@@ -220,7 +223,7 @@ class FastAnalysisService:
             "역할: 보호자 행동 코치.\n"
             "JSON 객체 하나만 출력하고 키는 care_todo 입니다.\n"
             "care_todo 값은 보호자가 바로 실행할 수 있는 행동을 4~6개 제안하는 배열이어야 합니다.\n"
-            "각 문장은 구체적인 행동과 이유를 함께 포함하세요."
+            "각 문장은 구체적인 행동과 이유를 함께 포함하고, 가능한 경우 노인을 이름으로 직접 언급하세요."
         )
 
         weekly_change_prompt = (
@@ -229,7 +232,7 @@ class FastAnalysisService:
             "JSON 객체의 키는 mood, meal, activity, graph_dummy_data 입니다.\n"
             "mood, meal, activity 값은 -100에서 100 사이 정수로 작성해 최근 변화량을 나타내세요.\n"
             "graph_dummy_data는 배열이며 Mon, Tue, Wed, Thu, Fri 다섯 항목을 포함해야 합니다.\n"
-            "각 항목은 day(요일), mood(0-100 정수) 키를 가진 객체로 작성하세요."
+            "각 항목은 day(요일), mood(0-100 정수) 키를 가진 객체로 작성하고, 필요시 노인 이름을 설명에 반영하세요."
         )
 
         ai_care_plan_prompt = (
@@ -237,6 +240,7 @@ class FastAnalysisService:
             "역할: 돌봄 코치.\n"
             "JSON 객체 하나를 출력하고 키는 today, this_week, this_month, this_year 입니다.\n"
             "각 값은 보호자가 실천할 수 있는 구체적인 계획을 한국어 한 문장으로 제안하세요.\n"
+            "모든 문장은 노인 이름을 포함해 보호자가 개인적으로 느낄 수 있도록 작성하세요."
             "계획들은 서로 중복되지 않게 작성하세요."
         )
 
