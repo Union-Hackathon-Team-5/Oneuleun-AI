@@ -51,6 +51,7 @@ class CaregiverService:
         
         # 감성적, 액션 중심 리포트로 변환
         print(f"[PERF] Starting _transform_to_caregiver_format", flush=True)
+        logger.info("[PERF] Starting _transform_to_caregiver_format")
         transform_start = time.time()
         result = await self._transform_to_caregiver_format(
             comprehensive_analysis=comprehensive_analysis,
@@ -146,6 +147,9 @@ class CaregiverService:
         print(f"[PERF] Parallel LLM calls completed in {parallel_time:.2f}s", flush=True)
         logger.info(f"[PERF] Parallel LLM calls completed in {parallel_time:.2f}s")
         
+        # 병렬 LLM 호출 이후 후처리 작업들 시간 측정
+        post_process_start = time.time()
+        
         # 1순위: 상태 개요 (key_concerns 생성 후에 결정하여 일관성 보장)
         status_overview = self._create_status_overview(comprehensive_analysis, key_concerns)
         
@@ -179,6 +183,9 @@ class CaregiverService:
         
         # 의료 책임 면책 조항 생성 (action_plan과 일치시킴)
         medical_disclaimer = self._create_medical_disclaimer(comprehensive_analysis, action_plan, key_concerns)
+        
+        post_process_time = time.time() - post_process_start
+        print(f"[PERF] Post-processing (data transformation) completed in {post_process_time:.2f}s", flush=True)
         
         return CaregiverFriendlyResponse(
             success=True,
@@ -259,55 +266,32 @@ class CaregiverService:
             if significant:
                 baseline_context = f"\n개인 baseline 비교: {len(significant)}개의 유의미한 변화 감지"
         
-        prompt = f"""
-다음 분석 결과를 바탕으로 보호자가 실제로 실행할 수 있는 구체적인 행동 계획을 세워주세요.
-중요: 과도한 경고를 피하고, 정말 필요한 조치만 우선순위를 높게 설정하세요.
+        # 프롬프트 간소화: 핵심만 포함
+        key_concerns_str = ", ".join(analysis.comprehensive_summary.key_concerns[:3]) if analysis.comprehensive_summary.key_concerns else "없음"
+        recommended_str = ", ".join(analysis.comprehensive_summary.recommended_actions[:3]) if analysis.comprehensive_summary.recommended_actions else "없음"
+        
+        prompt = f"""분석 결과 기반 행동 계획 생성 (간결하게):
 
-대화 내용: {conversation[:500]}...
+대화 요약: {conversation[:300]}...
 위험도: {analysis.comprehensive_summary.priority_level}
-주요 우려사항: {analysis.comprehensive_summary.key_concerns}
-권장 조치: {analysis.comprehensive_summary.recommended_actions}
+주요 우려: {key_concerns_str}
+권장 조치: {recommended_str}
 {baseline_context}
 
-다음 JSON 형식으로 응답해주세요:
+JSON 형식으로 응답 (각 카테고리 최대 3개):
 {{
-    "urgent_actions": [
-        {{
-            "action_id": 1,
-            "priority": "최우선",
-            "icon": "📞",
-            "title": "<구체적 행동>",
-            "reason": "<왜 필요한지>",
-            "detail": "<어머니가 실제로 하신 말씀 인용>",
-            "deadline": "<언제까지>",
-            "estimated_time": "<소요시간>",
-            "suggested_topics": ["<실제 대화 예시1>", "<실제 대화 예시2>"]
-        }}
-    ],
+    "urgent_actions": [{{"action_id": 1, "priority": "최우선|긴급|중요", "icon": "📞", "title": "구체적 행동", "reason": "이유", "detail": "어머니 말씀 인용", "deadline": "언제까지", "estimated_time": "소요시간", "suggested_topics": ["대화예시1", "대화예시2"]}}],
     "this_week_actions": [...],
     "long_term_actions": [...]
 }}
 
-중요: priority 필드는 반드시 다음 중 하나여야 합니다: "최우선", "긴급", "중요"
-다른 값(예: "보통", "낮음" 등)을 사용하지 마세요.
-
-주의사항:
-- urgent_actions는 정말 긴급한 경우에만 1-2개로 제한하세요
-- 건강 관련 조치에는 "의료진 상담 권장"이라는 표현을 사용하고, 진단하지 마세요
-- 언어 표현: 불안 유도형 표현 지양, 가족 케어 조언 톤 사용
-  - ❌ "즉각적인 의사 상담이 필요합니다" 
-  - ✅ "가벼운 진료 예약이라도 이번 주 안에 한 번 챙기면 좋겠습니다"
-  - ❌ "심각할 수 있습니다"
-  - ✅ "관심을 더 기울여주시면 좋을 것 같습니다"
-- 실제 대화 예시:
-  - "엄마 안 바빠요. 어디 불편하신 데 없으세요?"
-  - "식사는 잘 하세요? 제가 반찬 좀 가져다 드릴게요"
-  - "건강 관련 걱정이 있으시면 의료진과 상담하시는 것을 권장합니다"
+주의: urgent_actions는 긴급시 1-2개만. priority는 "최우선", "긴급", "중요" 중 하나만. 건강 관련은 "의료진 상담 권장" 표현 사용.
 """
         
         try:
             task_start = time.time()
-            response = await self.analysis_service._call_openai(prompt, max_tokens=1000, task_name="_generate_actionable_plan")
+            # max_tokens를 600으로 줄임 (실제로는 urgent 2개 + this_week 3개 + long_term 2개 정도면 충분)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=600, task_name="_generate_actionable_plan")
             task_time = time.time() - task_start
             print(f"[PERF] _generate_actionable_plan API call: {task_time:.2f}s", flush=True)
             logger.debug(f"[PERF] _generate_actionable_plan API call: {task_time:.2f}s")
@@ -393,40 +377,41 @@ class CaregiverService:
         image_analysis: Dict
     ) -> List[KeyConcern]:
         """주요 걱정거리 식별 (가족 케어 조언 톤)"""
-        prompt = f"""
-다음 정보를 바탕으로 보호자가 가장 걱정해야 할 문제들을 식별하고 구체적으로 설명해주세요.
+        # 위험 분석 정보 간소화
+        risk_level = analysis.risk_analysis.risk_level
+        risk_keywords = ", ".join(analysis.risk_analysis.detected_keywords[:5])
+        image_concerns = ", ".join(image_analysis.get('analysis', {}).get('concerns', [])[:3])
+        
+        prompt = f"""주요 걱정거리 식별 (최대 5개):
 
-대화: {conversation[:500]}...
-위험 분석: {analysis.risk_analysis.dict()}
-이미지 우려사항: {image_analysis.get('analysis', {}).get('concerns', [])}
+대화 요약: {conversation[:300]}...
+위험도: {risk_level}
+위험 키워드: {risk_keywords}
+이미지 우려: {image_concerns or "없음"}
 
-다음 JSON 형식으로 응답해주세요:
+JSON 형식 (간결하게):
 {{
     "concerns": [
         {{
             "concern_id": 1,
-            "type": "건강",
+            "type": "건강|안전|정서|생활",
             "icon": "🏥",
-            "severity": "urgent",
-            "title": "<구체적 문제>",
-            "description": "<상세 설명 - 가족 케어 조언 톤으로>",
+            "severity": "urgent|caution|normal",
+            "title": "구체적 문제",
+            "description": "가족 케어 조언 톤으로 간단히 설명",
             "detected_from": ["대화", "표정"],
-            "urgency_reason": "<왜 긴급한지>"
+            "urgency_reason": "왜 중요한지"
         }}
     ]
 }}
 
-중요: 언어 표현 지침
-- ❌ 피하기: "즉각적인 의사 상담이 필요합니다", "심각할 수 있습니다", "즉시 조치 필요"
-- ✅ 사용하기: "가벼운 진료 예약이라도 이번 주 안에 한 번 챙기면 좋겠습니다", "의료진 상담을 권장합니다", "관심을 더 기울여주시면 좋을 것 같습니다"
-
-걱정거리 유형: 건강, 안전, 정서, 생활
-심각도: urgent, caution, normal
+주의: "의료진 상담 권장" 표현 사용. "즉시 조치 필요" 같은 표현 피하기.
 """
         
         try:
             task_start = time.time()
-            response = await self.analysis_service._call_openai(prompt, max_tokens=800, task_name="_identify_key_concerns")
+            # max_tokens를 500으로 줄임 (concerns는 보통 3-5개, 각각 100 tokens 정도면 충분)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=500, task_name="_identify_key_concerns")
             task_time = time.time() - task_start
             print(f"[PERF] _identify_key_concerns API call: {task_time:.2f}s", flush=True)
             logger.debug(f"[PERF] _identify_key_concerns API call: {task_time:.2f}s")
