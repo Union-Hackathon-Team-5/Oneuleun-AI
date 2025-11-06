@@ -8,11 +8,6 @@ class AnalyzeUploadRequest(BaseModel):
     user_id: str = Field(..., description="노인 사용자 ID")
     senior_name: str = Field(..., description="노인 이름")
     conversation: str = Field(..., description="AI 질문과 노인 응답이 포함된 대화 내용")
-    audio_file_base64: Optional[str] = Field(
-        default=None,
-        description="Base64 인코딩된 음성 파일 (선택 사항)",
-    )
-
 
 class StatusSignal(BaseModel):
     health: str = Field(..., description="건강 상태 신호")
