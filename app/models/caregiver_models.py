@@ -144,6 +144,23 @@ class UIComponents(BaseModel):
     cta_buttons: List[CTAButton] = Field(..., description="행동 유도 버튼들")
 
 
+class EvidenceVisualization(BaseModel):
+    """근거 시각화 데이터"""
+    emotion_keywords: List[str] = Field(default_factory=list, description="감지된 감정 키워드 목록")
+    keyword_weights: Dict[str, float] = Field(default_factory=dict, description="키워드별 가중치")
+    facial_expression_timeline: List[Dict] = Field(default_factory=list, description="표정 변화 타임라인")
+    voice_energy_waveform: Optional[Dict] = Field(default=None, description="음성 에너지 파형 데이터")
+    score_breakdown: Dict[str, Dict] = Field(default_factory=dict, description="점수별 세부 분석")
+    calculation_method: str = Field(..., description="점수 계산 방법 설명")
+
+
+class MedicalDisclaimer(BaseModel):
+    """의료 책임 면책 조항"""
+    disclaimer_text: str = Field(..., description="면책 조항 텍스트")
+    is_recommendation_not_diagnosis: bool = Field(..., description="권고사항임을 명시")
+    suggested_action: str = Field(..., description="의사 상담 권장 여부")
+
+
 class CaregiverFriendlyResponse(BaseModel):
     """보호자 친화적 응답 모델"""
     success: bool = Field(..., description="성공 여부")
@@ -159,3 +176,8 @@ class CaregiverFriendlyResponse(BaseModel):
     detailed_analysis: DetailedAnalysis = Field(..., description="5순위: 상세 분석")
     trend_analysis: TrendAnalysis = Field(..., description="6순위: 추세 분석")
     ui_components: UIComponents = Field(..., description="UI 컴포넌트")
+    
+    # 🆕 신뢰성 개선 필드
+    evidence_visualization: EvidenceVisualization = Field(..., description="근거 시각화 데이터")
+    baseline_comparison: Optional[Dict] = Field(default=None, description="개인 baseline 비교 결과")
+    medical_disclaimer: MedicalDisclaimer = Field(..., description="의료 책임 면책 조항")

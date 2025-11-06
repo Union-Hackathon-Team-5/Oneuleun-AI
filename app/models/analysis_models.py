@@ -3,6 +3,18 @@ from pydantic import BaseModel, Field, validator
 from datetime import datetime
 
 
+class EmotionEvidence(BaseModel):
+    """감정 점수 계산 근거"""
+    positive_factors: List[str] = Field(default_factory=list, description="긍정 점수에 기여한 요인들")
+    negative_factors: List[str] = Field(default_factory=list, description="부정 점수에 기여한 요인들")
+    anxiety_factors: List[str] = Field(default_factory=list, description="불안 점수에 기여한 요인들")
+    depression_factors: List[str] = Field(default_factory=list, description="우울 점수에 기여한 요인들")
+    loneliness_factors: List[str] = Field(default_factory=list, description="외로움 점수에 기여한 요인들")
+    detected_keywords: List[str] = Field(default_factory=list, description="감지된 감정 키워드들")
+    facial_expression_notes: Optional[str] = Field(default=None, description="표정 분석 결과")
+    voice_energy_level: Optional[str] = Field(default=None, description="음성 에너지 수준")
+
+
 class EmotionAnalysis(BaseModel):
     """감정 상태 분석 결과"""
     positive: int = Field(..., ge=0, le=100, description="긍정 감정 점수")
@@ -12,6 +24,7 @@ class EmotionAnalysis(BaseModel):
     loneliness: int = Field(..., ge=0, le=100, description="외로움 점수")
     overall_mood: Literal["매우좋음", "좋음", "보통", "나쁨", "매우나쁨"] = Field(..., description="전반적 기분")
     emotional_summary: str = Field(..., description="감정 상태 한 문장 요약")
+    evidence: Optional[EmotionEvidence] = Field(default=None, description="점수 계산 근거")
 
 
 class ContentAnalysis(BaseModel):
@@ -41,6 +54,18 @@ class RiskAnalysis(BaseModel):
     recommended_actions: List[str] = Field(default_factory=list, description="권장 조치 사항")
 
 
+class BaselineComparison(BaseModel):
+    """개인 baseline 비교 결과"""
+    comparison_period: str = Field(..., description="비교 기간 (예: '지난 7일')")
+    metric: str = Field(..., description="비교 지표명")
+    current_value: float = Field(..., description="현재 값")
+    baseline_average: float = Field(..., description="baseline 평균값")
+    difference: float = Field(..., description="차이 (현재 - baseline)")
+    difference_percentage: float = Field(..., description="차이 비율 (%)")
+    is_significant_change: bool = Field(..., description="유의미한 변화 여부")
+    explanation: str = Field(..., description="변화 설명")
+
+
 class AnomalyAnalysis(BaseModel):
     """이상 패턴 감지 결과"""
     pattern_detected: bool = Field(..., description="이상 패턴 감지 여부")
@@ -50,6 +75,7 @@ class AnomalyAnalysis(BaseModel):
     comparison_notes: str = Field(..., description="과거 대비 변화 설명")
     alert_needed: bool = Field(..., description="알림 필요 여부")
     monitoring_recommendations: List[str] = Field(default_factory=list, description="모니터링 권장사항")
+    baseline_comparisons: List[BaselineComparison] = Field(default_factory=list, description="baseline 비교 결과")
 
 
 class EmotionScore(BaseModel):

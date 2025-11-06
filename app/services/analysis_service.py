@@ -10,7 +10,8 @@ from pydantic import ValidationError
 
 from app.models.analysis_models import (
     EmotionAnalysis, ContentAnalysis, RiskAnalysis, AnomalyAnalysis,
-    ComprehensiveAnalysisResult, ComprehensiveSummary, EmotionScore
+    ComprehensiveAnalysisResult, ComprehensiveSummary, EmotionScore,
+    EmotionEvidence, BaselineComparison
 )
 
 logger = logging.getLogger(__name__)
@@ -63,10 +64,11 @@ class AnalysisService:
             raise
     
     async def analyze_emotion_state(self, conversation: str, image_analysis: Optional[Dict] = None) -> EmotionAnalysis:
-        """감정 상태 분석 (대화 + 이미지 분석 종합)"""
+        """감정 상태 분석 (대화 + 이미지 분석 종합) + 근거 포함"""
         
         # 이미지 분석 데이터가 있으면 추가 컨텍스트로 활용
         image_context = ""
+        facial_notes = ""
         if image_analysis and "analysis" in image_analysis:
             img_data = image_analysis["analysis"]
             emotions = ", ".join(img_data.get("emotion", []))
@@ -80,9 +82,10 @@ class AnalysisService:
 - 표정 설명: {summary}
 - 우려사항: {", ".join(concerns) if concerns else "없음"}
 """
+            facial_notes = summary
         
         prompt = f"""
-다음 독거노인과 AI의 대화를 분석하여 감정 상태를 파악해주세요.
+다음 독거노인과 AI의 대화를 분석하여 감정 상태를 파악하고, 각 점수가 왜 그렇게 계산되었는지 구체적인 근거를 함께 제공해주세요.
 
 대화 내용:
 {conversation}
@@ -96,21 +99,48 @@ class AnalysisService:
     "depression": <0-100 우울 점수>,
     "loneliness": <0-100 외로움 점수>,
     "overall_mood": "<전반적 기분: 매우좋음/좋음/보통/나쁨/매우나쁨>",
-    "emotional_summary": "<한 문장 감정 요약>"
+    "emotional_summary": "<한 문장 감정 요약>",
+    "evidence": {{
+        "positive_factors": ["<긍정 점수에 기여한 대화 내용이나 표현들>", ...],
+        "negative_factors": ["<부정 점수에 기여한 대화 내용이나 표현들>", ...],
+        "anxiety_factors": ["<불안 점수에 기여한 요인들>", ...],
+        "depression_factors": ["<우울 점수에 기여한 요인들>", ...],
+        "loneliness_factors": ["<외로움 점수에 기여한 요인들>", ...],
+        "detected_keywords": ["<대화에서 감지된 감정 키워드들>", ...]
+    }}
 }}
+
+중요: 각 점수에 대해 구체적인 근거를 제공해야 합니다. 예를 들어 positive=20이면 "어떤 대화에서 그런 점수가 나왔는지" 명확히 설명해주세요.
 """
         
         try:
             response = await self._call_openai(prompt)
             data = json.loads(response)
-            return EmotionAnalysis.model_validate(data)
+            
+            # evidence 처리
+            evidence_data = data.get("evidence", {})
+            if facial_notes:
+                evidence_data["facial_expression_notes"] = facial_notes
+            
+            emotion_analysis = EmotionAnalysis(
+                positive=data.get("positive", 50),
+                negative=data.get("negative", 50),
+                anxiety=data.get("anxiety", 50),
+                depression=data.get("depression", 50),
+                loneliness=data.get("loneliness", 50),
+                overall_mood=data.get("overall_mood", "보통"),
+                emotional_summary=data.get("emotional_summary", "분석 실패"),
+                evidence=EmotionEvidence(**evidence_data) if evidence_data else None
+            )
+            return emotion_analysis
         except (json.JSONDecodeError, ValidationError) as exc:
             logger.error("Failed to parse emotion analysis response: %s", exc)
             return EmotionAnalysis(
                 positive=50, negative=50, anxiety=50, 
                 depression=50, loneliness=50,
                 overall_mood="보통",
-                emotional_summary="분석 실패"
+                emotional_summary="분석 실패",
+                evidence=None
             )
     
     async def analyze_conversation_content(self, conversation: str) -> ContentAnalysis:
@@ -205,8 +235,73 @@ class AnalysisService:
                 recommended_actions=[]
             )
     
+    def calculate_baseline_comparisons(
+        self,
+        current_emotion: EmotionAnalysis,
+        historical_data: Optional[List[Dict]] = None
+    ) -> List[BaselineComparison]:
+        """개인 baseline 비교 계산 (7일 평균 대비)"""
+        if not historical_data or len(historical_data) < 3:
+            return []  # 데이터 부족 시 빈 리스트
+        
+        # 최근 7일 데이터만 사용
+        recent_data = historical_data[-7:]
+        
+        # 각 지표별 baseline 계산
+        comparisons = []
+        
+        # 긍정 점수 비교
+        baseline_positive = sum(d.get("positive", 50) for d in recent_data) / len(recent_data)
+        diff_positive = current_emotion.positive - baseline_positive
+        diff_pct_positive = (diff_positive / baseline_positive * 100) if baseline_positive > 0 else 0
+        
+        comparisons.append(BaselineComparison(
+            comparison_period="지난 7일",
+            metric="긍정 감정",
+            current_value=float(current_emotion.positive),
+            baseline_average=baseline_positive,
+            difference=diff_positive,
+            difference_percentage=diff_pct_positive,
+            is_significant_change=abs(diff_pct_positive) > 20,  # 20% 이상 변화 시 유의미
+            explanation=f"평소 평균 {baseline_positive:.1f}점 대비 {diff_positive:+.1f}점 ({diff_pct_positive:+.1f}%)"
+        ))
+        
+        # 우울 점수 비교
+        baseline_depression = sum(d.get("depression", 50) for d in recent_data) / len(recent_data)
+        diff_depression = current_emotion.depression - baseline_depression
+        diff_pct_depression = (diff_depression / baseline_depression * 100) if baseline_depression > 0 else 0
+        
+        comparisons.append(BaselineComparison(
+            comparison_period="지난 7일",
+            metric="우울 감정",
+            current_value=float(current_emotion.depression),
+            baseline_average=baseline_depression,
+            difference=diff_depression,
+            difference_percentage=diff_pct_depression,
+            is_significant_change=abs(diff_pct_depression) > 20,
+            explanation=f"평소 평균 {baseline_depression:.1f}점 대비 {diff_depression:+.1f}점 ({diff_pct_depression:+.1f}%)"
+        ))
+        
+        # 외로움 점수 비교
+        baseline_loneliness = sum(d.get("loneliness", 50) for d in recent_data) / len(recent_data)
+        diff_loneliness = current_emotion.loneliness - baseline_loneliness
+        diff_pct_loneliness = (diff_loneliness / baseline_loneliness * 100) if baseline_loneliness > 0 else 0
+        
+        comparisons.append(BaselineComparison(
+            comparison_period="지난 7일",
+            metric="외로움 감정",
+            current_value=float(current_emotion.loneliness),
+            baseline_average=baseline_loneliness,
+            difference=diff_loneliness,
+            difference_percentage=diff_pct_loneliness,
+            is_significant_change=abs(diff_pct_loneliness) > 20,
+            explanation=f"평소 평균 {baseline_loneliness:.1f}점 대비 {diff_loneliness:+.1f}점 ({diff_pct_loneliness:+.1f}%)"
+        ))
+        
+        return comparisons
+    
     async def detect_anomaly_patterns(self, conversation: str, historical_data: Optional[List[Dict]] = None) -> AnomalyAnalysis:
-        """이상 패턴 감지 (과거 데이터와 비교)"""
+        """이상 패턴 감지 (과거 데이터와 비교) + baseline 비교 포함"""
         historical_context = ""
         if historical_data:
             recent_moods = [data.get("overall_mood", "보통") for data in historical_data[-7:]]  # 최근 7일
@@ -230,12 +325,17 @@ class AnalysisService:
     "alert_needed": <true/false>,
     "monitoring_recommendations": ["<모니터링 권장사항1>", ...]
 }}
+
+주의: alert_needed는 정말 심각한 경우에만 true로 설정하세요. 경미한 변화는 false로 설정하여 불필요한 불안을 유발하지 마세요.
 """
         
         try:
             response = await self._call_openai(prompt)
             data = json.loads(response)
-            return AnomalyAnalysis.model_validate(data)
+            
+            anomaly = AnomalyAnalysis.model_validate(data)
+            # baseline 비교는 나중에 추가됨 (analyze_video_letter_comprehensive에서)
+            return anomaly
         except (json.JSONDecodeError, ValidationError) as exc:
             logger.error("Failed to parse anomaly analysis response: %s", exc)
             return AnomalyAnalysis(
@@ -245,7 +345,8 @@ class AnalysisService:
                 trend_analysis="분석 실패",
                 comparison_notes="과거 데이터 부족",
                 alert_needed=False,
-                monitoring_recommendations=[]
+                monitoring_recommendations=[],
+                baseline_comparisons=[]
             )
     
     async def analyze_video_letter_comprehensive(
@@ -297,6 +398,12 @@ class AnalysisService:
                     alert_needed=False
                 )
             
+            # baseline 비교 계산 (historical_data가 있는 경우)
+            baseline_comparisons = []
+            if historical_data:
+                baseline_comparisons = self.calculate_baseline_comparisons(emotion_result, historical_data)
+                anomaly_result.baseline_comparisons = baseline_comparisons
+            
             # 종합 분석 결과 생성
             comprehensive_result = self._generate_comprehensive_summary(
                 emotion_result, content_result, risk_result, anomaly_result
@@ -333,11 +440,17 @@ class AnalysisService:
         elif emotion.overall_mood == "보통":
             overall_status = "😐 보통"
         
-        # 알림 여부 결정
+        # 알림 여부 결정 (과도한 경고 방지)
+        # baseline 비교가 있으면, 유의미한 변화가 있을 때만 alert
+        is_significant_change = False
+        if anomaly.baseline_comparisons:
+            is_significant_change = any(comp.is_significant_change for comp in anomaly.baseline_comparisons)
+        
+        # alert는 정말 심각한 경우에만 (과도한 경고 방지)
         alert_needed = (
-            risk.risk_level in ["긴급", "주의"] or 
-            anomaly.alert_needed or
-            emotion.overall_mood in ["나쁨", "매우나쁨"]
+            risk.risk_level == "긴급" or  # 긴급만 자동 alert
+            (risk.risk_level == "주의" and is_significant_change) or  # 주의는 baseline 변화가 있을 때만
+            (anomaly.alert_needed and anomaly.severity == "심각")  # 심각한 이상 패턴만
         )
         
         # 권장 조치 통합
