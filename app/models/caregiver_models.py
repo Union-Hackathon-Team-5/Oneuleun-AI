@@ -119,6 +119,8 @@ class TrendAnalysis(BaseModel):
     changes: List[TrendChange] = Field(..., description="변화들")
     alert_message: str = Field(..., description="알림 메시지")
     pattern: str = Field(..., description="패턴")
+    disabled: Optional[bool] = Field(default=False, description="비활성화 여부")
+    reason: Optional[str] = Field(default=None, description="비활성화 이유")
 
 
 class QuickStat(BaseModel):

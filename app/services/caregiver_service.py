@@ -84,27 +84,27 @@ class CaregiverService:
         
         # 4순위: 행동 계획 (이미 생성됨)
         
-        # 5순위: 상세 분석
+        # 5순위: 상세 분석 (key_concerns와 일치시킴)
         detailed_analysis = self._create_detailed_analysis(
-            comprehensive_analysis, conversation, audio_analysis
+            comprehensive_analysis, conversation, audio_analysis, key_concerns
         )
         
-        # 6순위: 추세 분석
-        trend_analysis = self._create_trend_analysis(comprehensive_analysis)
+        # Baseline 비교 데이터 생성 (추세 분석 전에 필요)
+        baseline_comparison = self._create_baseline_comparison(comprehensive_analysis)
+        
+        # 6순위: 추세 분석 (baseline 비교 기반으로 활성화/비활성화)
+        trend_analysis = self._create_trend_analysis(comprehensive_analysis, baseline_comparison)
         
         # UI 컴포넌트
         ui_components = self._create_ui_components(status_overview, comprehensive_analysis)
         
-        # 근거 시각화 데이터 생성
+        # 근거 시각화 데이터 생성 (맥락 충돌 감지 포함)
         evidence_viz = self._create_evidence_visualization(
-            comprehensive_analysis, conversation, audio_analysis, image_analysis
+            comprehensive_analysis, conversation, audio_analysis, image_analysis, key_concerns
         )
         
-        # Baseline 비교 데이터 생성
-        baseline_comparison = self._create_baseline_comparison(comprehensive_analysis)
-        
-        # 의료 책임 면책 조항 생성
-        medical_disclaimer = self._create_medical_disclaimer(comprehensive_analysis)
+        # 의료 책임 면책 조항 생성 (action_plan과 일치시킴)
+        medical_disclaimer = self._create_medical_disclaimer(comprehensive_analysis, action_plan, key_concerns)
         
         return CaregiverFriendlyResponse(
             success=True,
@@ -155,7 +155,7 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=500)
             return json.loads(response)
         except Exception as exc:
             logger.error("Failed to generate emotional insights: %s", exc)
@@ -210,6 +210,9 @@ class CaregiverService:
     "long_term_actions": [...]
 }}
 
+중요: priority 필드는 반드시 다음 중 하나여야 합니다: "최우선", "긴급", "중요"
+다른 값(예: "보통", "낮음" 등)을 사용하지 마세요.
+
 주의사항:
 - urgent_actions는 정말 긴급한 경우에만 1-2개로 제한하세요
 - 건강 관련 조치에는 "의료진 상담 권장"이라는 표현을 사용하고, 진단하지 마세요
@@ -225,12 +228,32 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=1000)
             data = json.loads(response)
             
-            urgent_actions = [UrgentAction(**action) for action in data.get("urgent_actions", [])]
-            this_week_actions = [UrgentAction(**action) for action in data.get("this_week_actions", [])]
-            long_term_actions = [UrgentAction(**action) for action in data.get("long_term_actions", [])]
+            # priority 필드 검증 및 기본값 처리
+            valid_priorities = ["최우선", "긴급", "중요"]
+            
+            def normalize_action(action: Dict) -> Dict:
+                """priority 필드 정규화"""
+                if "priority" in action:
+                    priority = action["priority"]
+                    if priority not in valid_priorities:
+                        # 유효하지 않은 priority를 기본값으로 변경
+                        if priority in ["보통", "낮음", "normal", "low"]:
+                            action["priority"] = "중요"
+                        elif priority in ["높음", "high", "urgent"]:
+                            action["priority"] = "긴급"
+                        else:
+                            action["priority"] = "중요"  # 기본값
+                else:
+                    action["priority"] = "중요"  # 기본값
+                return action
+            
+            # Pydantic model_validate로 최적화 (priority 정규화 후)
+            urgent_actions = [UrgentAction.model_validate(normalize_action(action)) for action in data.get("urgent_actions", [])]
+            this_week_actions = [UrgentAction.model_validate(normalize_action(action)) for action in data.get("this_week_actions", [])]
+            long_term_actions = [UrgentAction.model_validate(normalize_action(action)) for action in data.get("long_term_actions", [])]
             
             return ActionPlan(
                 urgent_actions=urgent_actions,
@@ -266,7 +289,7 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=400)
             data = json.loads(response)
             return data.get("mother_voice", [])
         except Exception as exc:
@@ -316,9 +339,10 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt)
+            response = await self.analysis_service._call_openai(prompt, max_tokens=800)
             data = json.loads(response)
-            return [KeyConcern(**concern) for concern in data.get("concerns", [])]
+            # Pydantic model_validate로 최적화
+            return [KeyConcern.model_validate(concern) for concern in data.get("concerns", [])]
         except Exception as exc:
             logger.error("Failed to identify key concerns: %s", exc)
             return self._create_default_concerns(analysis)
@@ -408,8 +432,29 @@ class CaregiverService:
             mood_label = f"매우 우울함{baseline_info}" if baseline_info else "매우 우울함"
             mood_emoji = "😢"
         
+        # headline 개선: 긴급 근거 중심 (용어·톤 일관성)
+        headline = emotional_insights.get("headline", "어머니 상태를 확인해보세요")
+        
+        # 긴급한 경우(urgent) 건강 관련 구체적 근거를 headline에 포함
+        if analysis.comprehensive_summary.priority_level == "긴급":
+            urgent_health_issues = []
+            health_str = str(analysis.risk_analysis.risk_categories.health)
+            safety_str = str(analysis.risk_analysis.risk_categories.safety)
+            
+            if "식사" in health_str or "밥" in health_str or "음식" in health_str:
+                urgent_health_issues.append("식사량 감소")
+            if "통증" in health_str or "아파" in health_str:
+                urgent_health_issues.append("통증")
+            if "낙상" in safety_str:
+                urgent_health_issues.append("낙상 위험")
+            
+            if urgent_health_issues:
+                headline = f"{', '.join(urgent_health_issues)}가 동반되어 즉시 확인이 필요합니다"
+            else:
+                headline = "즉시 확인이 필요한 상태입니다"
+        
         return TodaySummary(
-            headline=emotional_insights.get("headline", "어머니 상태를 확인해보세요"),
+            headline=headline,
             mood_score=mood_score,
             mood_label=mood_label,
             mood_emoji=mood_emoji,
@@ -422,7 +467,8 @@ class CaregiverService:
         self, 
         analysis: ComprehensiveAnalysisResult, 
         conversation: str,
-        audio_analysis: Dict
+        audio_analysis: Dict,
+        key_concerns: List[KeyConcern]
     ) -> DetailedAnalysis:
         """상세 분석 생성"""
         # 대화 주제별 요약
@@ -444,14 +490,40 @@ class CaregiverService:
             )
         ]
         
-        # 위험 지표
+        # 위험 지표 (R3: key_concerns의 최대 severity 기준)
+        health_concerns = [c for c in key_concerns if c.type == "건강"]
+        mental_concerns = [c for c in key_concerns if c.type == "정서"]
+        
+        # 최대 severity 찾기
+        severity_map = {"urgent": 3, "caution": 2, "normal": 1}
+        
+        health_max_severity = "normal"
+        if health_concerns:
+            health_max_severity_value = max(severity_map.get(c.severity, 1) for c in health_concerns)
+            health_max_severity = [k for k, v in severity_map.items() if v == health_max_severity_value][0]
+        
+        mental_max_severity = "normal"
+        if mental_concerns:
+            mental_max_severity_value = max(severity_map.get(c.severity, 1) for c in mental_concerns)
+            mental_max_severity = [k for k, v in severity_map.items() if v == mental_max_severity_value][0]
+        
+        # severity를 level로 변환 (urgent/caution -> high, normal -> medium/low)
+        health_level = "high" if health_max_severity == "urgent" else "medium" if health_max_severity == "caution" else "low"
+        mental_level = "high" if mental_max_severity == "urgent" else "medium" if mental_max_severity == "caution" else "low"
+        
+        # 기존 분석 결과와 병합 (더 높은 레벨 우선)
+        if analysis.comprehensive_summary.priority_level == "긴급" and health_level != "high":
+            health_level = "high"
+        if analysis.emotion_analysis.depression > 70 and mental_level != "high":
+            mental_level = "high"
+        
         risk_indicators = {
             "health_risk": RiskIndicator(
-                level="high" if analysis.comprehensive_summary.priority_level == "긴급" else "medium",
+                level=health_level,
                 factors=analysis.risk_analysis.risk_categories.health
             ),
             "mental_risk": RiskIndicator(
-                level="high" if analysis.emotion_analysis.depression > 70 else "medium",
+                level=mental_level,
                 factors=analysis.risk_analysis.risk_categories.mental
             )
         }
@@ -486,31 +558,52 @@ class CaregiverService:
             audio_analysis=audio_analysis_obj
         )
     
-    def _create_trend_analysis(self, analysis: ComprehensiveAnalysisResult) -> TrendAnalysis:
-        """추세 분석 생성"""
-        # 더미 추세 데이터 (실제로는 과거 데이터와 비교)
-        changes = [
-            TrendChange(
-                metric="기분",
-                direction="down",
-                change=-35,
-                icon="📉",
-                comment="지난주 대비 35점 하락"
-            ),
-            TrendChange(
-                metric="활동량",
-                direction="down",
-                change=-50,
-                icon="📉",
-                comment="외출 빈도 감소"
+    def _create_trend_analysis(self, analysis: ComprehensiveAnalysisResult, baseline_comparison: Optional[Dict]) -> TrendAnalysis:
+        """추세 분석 생성 (R5: 7일 미만이면 비활성화)"""
+        # baseline_comparison이 없거나 데이터 부족 시 비활성화
+        if not baseline_comparison or baseline_comparison.get("comparison_period", "").endswith("데이터 부족"):
+            return TrendAnalysis(
+                compared_to="지난 7일",
+                changes=[],
+                alert_message="7일 미만 데이터로 신뢰 낮음",
+                pattern="데이터 부족",
+                disabled=True,
+                reason="7일 미만 데이터로 신뢰 낮음"
             )
-        ]
+        
+        # baseline_comparison에서 추세 데이터 생성
+        significant_changes = baseline_comparison.get("significant_changes", [])
+        changes = []
+        
+        for change in significant_changes[:5]:  # 최대 5개
+            direction = "down" if change.get("difference", 0) < 0 else "up" if change.get("difference", 0) > 0 else "stable"
+            icon = "📉" if direction == "down" else "📈" if direction == "up" else "➡️"
+            
+            changes.append(TrendChange(
+                metric=change.get("metric", ""),
+                direction=direction,
+                change=int(change.get("difference", 0)),
+                icon=icon,
+                comment=change.get("explanation", "")
+            ))
+        
+        if not changes:
+            # 유의미한 변화가 없으면 안정적 표시
+            return TrendAnalysis(
+                compared_to="지난 7일",
+                changes=[],
+                alert_message="지난 7일 대비 큰 변화 없음",
+                pattern="안정적"
+            )
+        
+        alert_message = f"⚠️ 지난 7일 대비 {len(changes)}개의 유의미한 변화가 감지되었습니다"
+        pattern = "지속적 하락" if any(c.direction == "down" for c in changes) else "지속적 상승" if any(c.direction == "up" for c in changes) else "변동"
         
         return TrendAnalysis(
-            compared_to="지난주",
+            compared_to="지난 7일",
             changes=changes,
-            alert_message="⚠️ 지난주 대비 전반적으로 악화되었습니다",
-            pattern="지속적 하락"
+            alert_message=alert_message,
+            pattern=pattern
         )
     
     def _create_ui_components(
@@ -629,7 +722,8 @@ class CaregiverService:
         analysis: ComprehensiveAnalysisResult,
         conversation: str,
         audio_analysis: Dict,
-        image_analysis: Dict
+        image_analysis: Dict,
+        key_concerns: List[KeyConcern]
     ) -> EvidenceVisualization:
         """근거 시각화 데이터 생성"""
         emotion_evidence = analysis.emotion_analysis.evidence
@@ -642,9 +736,31 @@ class CaregiverService:
             all_keywords = emotion_evidence.detected_keywords
             emotion_keywords = all_keywords[:10]  # 최대 10개
             
-            # 키워드별 가중치 (간단한 휴리스틱)
+            # 키워드별 가중치 개선: 빈도×강도×최근성 (R6)
+            keyword_counts = {}
             for keyword in all_keywords:
-                keyword_weights[keyword] = 1.0 / len(all_keywords) if all_keywords else 0.0
+                keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
+            
+            # 감정 강도 매핑 (높을수록 중요)
+            emotion_intensity = {
+                "우울": 0.9, "슬픔": 0.8, "외로움": 0.7, "불안": 0.8, "분노": 0.7,
+                "무기력": 0.6, "피곤": 0.5, "행복": 0.3, "기쁨": 0.3
+            }
+            
+            # 가중치 계산: 빈도 × 강도 (최근성은 일단 생략)
+            raw_weights = {}
+            for keyword, count in keyword_counts.items():
+                intensity = emotion_intensity.get(keyword, 0.5)
+                raw_weights[keyword] = count * intensity
+            
+            # Softmax 정규화 (합 = 1)
+            total_weight = sum(raw_weights.values())
+            if total_weight > 0:
+                for keyword, weight in raw_weights.items():
+                    keyword_weights[keyword] = weight / total_weight
+            else:
+                for keyword in all_keywords:
+                    keyword_weights[keyword] = 1.0 / len(all_keywords) if all_keywords else 0.0
         
         # 표정 변화 타임라인 (신뢰도 기준 필터링)
         facial_timeline = []
@@ -656,14 +772,42 @@ class CaregiverService:
             
             # confidence가 낮으면 감정 미검출 처리
             if confidence >= confidence_threshold and emotions:
+                # 텍스트 기반 감정 추출 (대화 맥락)
+                text_emotions = set()
+                if emotion_evidence and emotion_evidence.detected_keywords:
+                    for kw in emotion_evidence.detected_keywords:
+                        if "우울" in kw or "슬픔" in kw:
+                            text_emotions.add("우울")
+                        elif "피곤" in kw or "무기력" in kw:
+                            text_emotions.add("무기력")
+                        elif "외로움" in kw:
+                            text_emotions.add("외로움")
+                        elif "분노" in kw or "화" in kw:
+                            text_emotions.add("분노")
+                
                 for i, emotion in enumerate(emotions[:5]):  # 최대 5개
                     # 각 감정별 confidence 계산 (전체 confidence를 기반으로)
                     emotion_confidence = max(confidence_threshold, confidence - (i * 5))
+                    
+                    # 맥락 충돌 감지 (R4): 텍스트와 표정 불일치 체크
+                    context_mismatch = False
+                    if text_emotions and emotion not in text_emotions:
+                        # 예: 표정은 분노인데 텍스트는 우울/피곤
+                        if emotion == "분노" and ("우울" in text_emotions or "무기력" in text_emotions):
+                            context_mismatch = True
+                        elif emotion in ["기쁨", "행복"] and ("우울" in text_emotions or "외로움" in text_emotions):
+                            context_mismatch = True
+                    
+                    reliability = "높음" if emotion_confidence >= 80 else "보통" if emotion_confidence >= 60 else "낮음"
+                    if context_mismatch:
+                        reliability = "보류"
+                    
                     facial_timeline.append({
                         "timestamp": f"00:0{i*10}:00",
                         "emotion": emotion,
                         "confidence": emotion_confidence,
-                        "reliability": "높음" if emotion_confidence >= 80 else "보통" if emotion_confidence >= 60 else "낮음"
+                        "reliability": reliability,
+                        "note": "텍스트/음성 맥락과 불일치하여 검증 필요" if context_mismatch else None
                     })
             else:
                 # confidence가 낮으면 감정 미검출로 표시
@@ -721,17 +865,19 @@ class CaregiverService:
                 }
             }
         
-        # 계산 방법 설명 + 확실도 표시
-        confidence = image_analysis.get("confidence", 0) if image_analysis.get("analysis") else 0
-        calculation_method = "감정 점수는 대화 내용, 표정 분석, 음성 톤을 종합하여 AI 모델이 계산합니다. 각 점수는 0-100 범위이며, 여러 요인을 고려하여 결정됩니다."
+        # 멀티모달 신뢰도 가중 평균 계산 (R4)
+        text_confidence = 0.75  # 텍스트 분석 기본 신뢰도
+        audio_confidence = 0.65 if audio_analysis.get("shout_detection") else 0.60
+        face_confidence = image_analysis.get("confidence", 0) / 100.0 if image_analysis.get("analysis") else 0
         
-        if confidence > 0:
-            if confidence >= 80:
-                calculation_method += f" 이번 분석의 감정 판단 확실도는 {confidence}%로 비교적 높습니다."
-            elif confidence >= 60:
-                calculation_method += f" 이번 분석의 감정 판단 확실도는 {confidence}%로 보통입니다. 해석 시 신중이 필요합니다."
-            else:
-                calculation_method += f" 이번 분석의 감정 판단 확실도는 {confidence}%로 낮습니다. 참고용으로만 활용하시기 바랍니다."
+        # 가중치: text 0.6, audio 0.25, face 0.15
+        w_text, w_audio, w_face = 0.6, 0.25, 0.15
+        overall_confidence = (w_text * text_confidence + w_audio * audio_confidence + w_face * face_confidence) * 100
+        
+        # 계산 방법 설명 + 멀티모달 확실도 표시
+        calculation_method = f"감정 점수는 대화 내용(가중치 60%), 음성 톤(가중치 25%), 표정 분석(가중치 15%)을 종합하여 계산합니다. "
+        calculation_method += f"전체 신뢰도: {overall_confidence:.1f}% (텍스트 {text_confidence*100:.0f}%, 음성 {audio_confidence*100:.0f}%, 표정 {face_confidence*100:.0f}%). "
+        calculation_method += "각 점수는 0-100 범위이며, 여러 요인을 고려하여 결정됩니다."
         
         if emotion_evidence and emotion_evidence.facial_expression_notes:
             calculation_method += f" 표정 분석 결과: '{emotion_evidence.facial_expression_notes[:50]}...'"
@@ -806,30 +952,46 @@ class CaregiverService:
             "mood_comparison": mood_change  # 가장 중요한 비교 정보
         }
     
-    def _create_medical_disclaimer(self, analysis: ComprehensiveAnalysisResult) -> MedicalDisclaimer:
-        """의료 책임 면책 조항 생성"""
-        # 건강 관련 권장사항이 있는지 확인
-        has_health_recommendations = False
-        health_keywords = ["의사", "병원", "상담", "진료", "약", "증상"]
+    def _create_medical_disclaimer(
+        self, 
+        analysis: ComprehensiveAnalysisResult, 
+        action_plan: ActionPlan,
+        key_concerns: List[KeyConcern]
+    ) -> MedicalDisclaimer:
+        """의료 책임 면책 조항 생성 (R2: action_plan과 일치)"""
+        # 고정 면책 조항
+        disclaimer_text = (
+            "본 분석 결과는 참고용 정보이며, 의료 진단이 아닙니다. "
+            "우려가 지속되면 의료진과 상담하세요."
+        )
         
-        for action in analysis.comprehensive_summary.recommended_actions:
-            if any(keyword in action for keyword in health_keywords):
-                has_health_recommendations = True
-                break
+        # action_plan의 urgent_actions에서 건강 관련 액션 확인
+        health_urgent_actions = []
+        health_keywords = ["의사", "병원", "상담", "진료", "약", "증상", "통증", "식사", "음식"]
         
-        if has_health_recommendations:
-            disclaimer_text = (
-                "⚠️ 본 분석 결과는 의료 진단이 아닌 참고용 정보입니다. "
-                "건강 관련 권장사항은 전문 의료진의 상담을 받으시기 바랍니다. "
-                "본 서비스는 의료 행위를 하지 않으며, 진단이나 치료를 대체하지 않습니다."
-            )
-            suggested_action = "건강 관련 우려사항이 있으니 의료진 상담을 권장합니다."
+        for action in action_plan.urgent_actions:
+            if any(keyword in action.title or keyword in action.detail for keyword in health_keywords):
+                health_urgent_actions.append(action)
+        
+        # key_concerns에서 건강 관련 urgent 확인
+        health_urgent_concerns = [c for c in key_concerns if c.type == "건강" and c.severity == "urgent"]
+        
+        # suggested_action 생성 (R2: action_plan과 일치)
+        if health_urgent_actions or health_urgent_concerns:
+            # urgent 액션이 있으면 구체적으로 표시
+            action_titles = [a.title for a in health_urgent_actions[:2]]
+            if action_titles:
+                suggested_action = f"이번 주 내 가벼운 진료 예약 권장 ({', '.join(action_titles[:2])})"
+            else:
+                concern_titles = [c.title for c in health_urgent_concerns[:2]]
+                suggested_action = f"이번 주 내 가벼운 진료 예약 권장 ({', '.join(concern_titles[:2])})"
         else:
-            disclaimer_text = (
-                "본 분석 결과는 참고용 정보이며, 의료 진단이 아닙니다. "
-                "건강 상태가 우려되시면 전문 의료진의 상담을 받으시기 바랍니다."
-            )
-            suggested_action = "현재 건강 관련 권장사항은 없습니다."
+            # 일반적인 건강 관련 권장사항만 있는 경우
+            has_health_mention = any(keyword in action.title for action in action_plan.this_week_actions for keyword in health_keywords)
+            if has_health_mention:
+                suggested_action = "건강 관련 우려사항이 있으니 의료진 상담을 권장합니다."
+            else:
+                suggested_action = "현재 건강 관련 권장사항은 없습니다."
         
         return MedicalDisclaimer(
             disclaimer_text=disclaimer_text,
