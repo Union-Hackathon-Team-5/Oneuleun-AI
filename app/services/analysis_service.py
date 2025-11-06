@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
@@ -32,11 +33,18 @@ class AnalysisService:
     
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            # 연결 풀을 늘려서 병렬 요청을 보장
+            # 타임아웃을 15초로 줄여서 빠른 실패 보장
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=20)
+            timeout = httpx.Timeout(15.0, connect=5.0)  # 총 15초, 연결 5초
+            self._client = httpx.AsyncClient(timeout=timeout, limits=limits)
         return self._client
     
-    async def _call_openai(self, prompt: str, max_tokens: int = 800) -> str:
-        """OpenAI API 호출 (JSON 형식 강제, 최적화)"""
+    async def _call_openai(self, prompt: str, max_tokens: int = 800, task_name: str = "unknown", timeout_seconds: float = 15.0) -> str:
+        """OpenAI API 호출 (JSON 형식 강제, 최적화, 타임아웃 적용)"""
+        call_start = time.time()
+        print(f"[PERF] Starting API call: {task_name} (tokens: {max_tokens})", flush=True)
+        
         payload = {
             "model": self.model,
             "messages": [
@@ -55,10 +63,23 @@ class AnalysisService:
         
         try:
             client = await self._get_client()
-            response = await client.post(self.base_url, headers=headers, json=payload)
+            api_start = time.time()
+            # asyncio.wait_for로 개별 작업 타임아웃 강제
+            response = await asyncio.wait_for(
+                client.post(self.base_url, headers=headers, json=payload),
+                timeout=timeout_seconds
+            )
+            api_time = time.time() - api_start
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"].strip()
+            result = data["choices"][0]["message"]["content"].strip()
+            total_time = time.time() - call_start
+            print(f"[PERF] Completed API call: {task_name} - {api_time:.2f}s (total: {total_time:.2f}s, tokens: {max_tokens})", flush=True)
+            logger.debug(f"[PERF] OpenAI API call: {api_time:.2f}s (total: {total_time:.2f}s, tokens: {max_tokens})")
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"OpenAI API call timeout: {task_name} (>{timeout_seconds}s)")
+            raise RuntimeError(f"{task_name} 호출이 {timeout_seconds}초 내에 완료되지 않았습니다.") from None
         except Exception as exc:
             logger.error("OpenAI API call failed: %s", exc)
             raise
@@ -114,7 +135,7 @@ class AnalysisService:
 """
         
         try:
-            response = await self._call_openai(prompt, max_tokens=800)
+            response = await self._call_openai(prompt, max_tokens=800, task_name="analyze_emotion_state")
             data = json.loads(response)
             
             # evidence 처리
@@ -169,7 +190,7 @@ class AnalysisService:
 """
         
         try:
-            response = await self._call_openai(prompt, max_tokens=600)
+            response = await self._call_openai(prompt, max_tokens=600, task_name="analyze_conversation_content")
             data = json.loads(response)
             return ContentAnalysis.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
@@ -227,7 +248,7 @@ class AnalysisService:
 """
         
         try:
-            response = await self._call_openai(prompt, max_tokens=700)
+            response = await self._call_openai(prompt, max_tokens=700, task_name="detect_risk_keywords")
             data = json.loads(response)
             return RiskAnalysis.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
@@ -356,7 +377,7 @@ class AnalysisService:
 """
         
         try:
-            response = await self._call_openai(prompt, max_tokens=500)
+            response = await self._call_openai(prompt, max_tokens=500, task_name="detect_anomaly_patterns")
             data = json.loads(response)
             
             anomaly = AnomalyAnalysis.model_validate(data)
@@ -381,48 +402,75 @@ class AnalysisService:
         historical_data: Optional[List[Dict]] = None,
         image_analysis: Optional[Dict] = None
     ) -> ComprehensiveAnalysisResult:
-        """영상 편지 종합 분석 (병렬 처리)"""
+        """영상 편지 종합 분석 (병렬 처리, 타임아웃 최적화)"""
+        print(f"[PERF] Starting analyze_video_letter_comprehensive (4 parallel tasks)", flush=True)
+        logger.info("[PERF] Starting analyze_video_letter_comprehensive (4 parallel tasks)")
+        parallel_start = time.time()
         
-        # 모든 분석을 병렬로 실행 (이미지 분석 데이터 포함)
-        emotion_task = self.analyze_emotion_state(conversation, image_analysis)
-        content_task = self.analyze_conversation_content(conversation)
-        risk_task = self.detect_risk_keywords(conversation, image_analysis)
-        anomaly_task = self.detect_anomaly_patterns(conversation, historical_data)
-        
-        try:
-            # 모든 분석 결과를 병렬로 기다림
-            emotion_result, content_result, risk_result, anomaly_result = await asyncio.gather(
-                emotion_task, content_task, risk_task, anomaly_task,
-                return_exceptions=True
-            )
-            
-            # 예외 처리
-            if isinstance(emotion_result, Exception):
-                logger.error("Emotion analysis failed: %s", emotion_result)
-                emotion_result = EmotionAnalysis(
+        # 각 작업에 개별 타임아웃 적용 (15초)
+        async def emotion_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self.analyze_emotion_state(conversation, image_analysis),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Emotion analysis failed/timeout: {exc}")
+                return EmotionAnalysis(
                     positive=50, negative=50, anxiety=50, depression=50, loneliness=50,
                     overall_mood="보통", emotional_summary="분석 실패"
                 )
-            
-            if isinstance(content_result, Exception):
-                logger.error("Content analysis failed: %s", content_result)
-                content_result = ContentAnalysis(summary="분석 실패")
-            
-            if isinstance(risk_result, Exception):
-                logger.error("Risk analysis failed: %s", risk_result)
+        
+        async def content_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self.analyze_conversation_content(conversation),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Content analysis failed/timeout: {exc}")
+                return ContentAnalysis(summary="분석 실패")
+        
+        async def risk_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self.detect_risk_keywords(conversation, image_analysis),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Risk analysis failed/timeout: {exc}")
                 from app.models.analysis_models import RiskCategories
-                risk_result = RiskAnalysis(
+                return RiskAnalysis(
                     risk_level="보통", detected_keywords=[], 
                     risk_categories=RiskCategories()
                 )
-            
-            if isinstance(anomaly_result, Exception):
-                logger.error("Anomaly analysis failed: %s", anomaly_result)
-                anomaly_result = AnomalyAnalysis(
+        
+        async def anomaly_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self.detect_anomaly_patterns(conversation, historical_data),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Anomaly analysis failed/timeout: {exc}")
+                return AnomalyAnalysis(
                     pattern_detected=False, pattern_type="없음", severity="경미",
                     trend_analysis="분석 실패", comparison_notes="과거 데이터 부족",
                     alert_needed=False
                 )
+        
+        try:
+            # 모든 분석 결과를 병렬로 기다림 (각각 최대 15초)
+            emotion_result, content_result, risk_result, anomaly_result = await asyncio.gather(
+                emotion_with_timeout(),
+                content_with_timeout(),
+                risk_with_timeout(),
+                anomaly_with_timeout(),
+                return_exceptions=False  # 이미 타임아웃 처리됨
+            )
+            parallel_time = time.time() - parallel_start
+            print(f"[PERF] Parallel analysis completed in {parallel_time:.2f}s", flush=True)
+            logger.info(f"[PERF] Parallel analysis completed in {parallel_time:.2f}s")
             
             # baseline 비교 계산 (historical_data가 있는 경우)
             baseline_comparisons = []

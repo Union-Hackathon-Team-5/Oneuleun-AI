@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -33,16 +34,25 @@ class CaregiverService:
         historical_data: Optional[List[Dict]] = None
     ) -> CaregiverFriendlyResponse:
         """보호자 친화적 리포트 생성"""
+        start_time = time.time()
         
         # 기존 기술적 분석 실행 (historical_data 포함)
+        print(f"[PERF] Starting comprehensive_analysis", flush=True)
+        logger.info("[PERF] Starting comprehensive_analysis")
+        comp_start = time.time()
         comprehensive_analysis = await self.analysis_service.analyze_video_letter_comprehensive(
             conversation=conversation,
             image_analysis=image_analysis,
             historical_data=historical_data
         )
+        comp_time = time.time() - comp_start
+        print(f"[PERF] comprehensive_analysis completed in {comp_time:.2f}s", flush=True)
+        logger.info(f"[PERF] comprehensive_analysis completed in {comp_time:.2f}s")
         
         # 감성적, 액션 중심 리포트로 변환
-        return await self._transform_to_caregiver_format(
+        print(f"[PERF] Starting _transform_to_caregiver_format", flush=True)
+        transform_start = time.time()
+        result = await self._transform_to_caregiver_format(
             comprehensive_analysis=comprehensive_analysis,
             conversation=conversation,
             image_analysis=image_analysis,
@@ -50,6 +60,14 @@ class CaregiverService:
             session_id=session_id,
             user_id=user_id
         )
+        transform_time = time.time() - transform_start
+        total_time = time.time() - start_time
+        print(f"[PERF] _transform_to_caregiver_format completed in {transform_time:.2f}s", flush=True)
+        print(f"[PERF] Total time: {total_time:.2f}s", flush=True)
+        logger.info(f"[PERF] _transform_to_caregiver_format completed in {transform_time:.2f}s")
+        logger.info(f"[PERF] Total time: {total_time:.2f}s")
+        
+        return result
     
     async def _transform_to_caregiver_format(
         self,
@@ -62,15 +80,71 @@ class CaregiverService:
     ) -> CaregiverFriendlyResponse:
         """기술적 분석을 보호자 친화적 형태로 변환"""
         
-        # 감성적 인사이트 생성 (병렬 처리)
-        insights_task = self._generate_emotional_insights(conversation, comprehensive_analysis)
-        action_plan_task = self._generate_actionable_plan(comprehensive_analysis, conversation)
-        mother_voice_task = self._extract_mother_voice(conversation)
-        concerns_task = self._identify_key_concerns(comprehensive_analysis, conversation, image_analysis)
+        # 감성적 인사이트 생성 (병렬 처리, 타임아웃 적용)
+        print(f"[PERF] Starting parallel LLM calls (4 tasks)", flush=True)
+        logger.info("[PERF] Starting parallel LLM calls (4 tasks)")
+        parallel_start = time.time()
+        
+        # 각 작업에 타임아웃 래퍼 적용 (15초)
+        async def insights_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self._generate_emotional_insights(conversation, comprehensive_analysis),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Emotional insights generation failed/timeout: {exc}")
+                return {
+                    "headline": "어머니 상태를 확인이 필요합니다",
+                    "mood_description": "평소보다 기분이 좋지 않으신 것 같아요",
+                    "energy_level": "활력이 부족해 보입니다",
+                    "pain_level": "몸이 불편하신 것 같아요",
+                    "emotional_state": "관심과 돌봄이 필요한 상태입니다"
+                }
+        
+        async def action_plan_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self._generate_actionable_plan(comprehensive_analysis, conversation),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Action plan generation failed/timeout: {exc}")
+                return self._create_default_action_plan(comprehensive_analysis)
+        
+        async def mother_voice_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self._extract_mother_voice(conversation),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Mother voice extraction failed/timeout: {exc}")
+                return [
+                    "💬 \"요즘 컨디션이 별로 좋지 않아요\"",
+                    "💬 \"혼자 있는 시간이 많아서 외로워요\"",
+                    "💬 \"몸이 예전 같지 않아서 걱정이에요\""
+                ]
+        
+        async def concerns_with_timeout():
+            try:
+                return await asyncio.wait_for(
+                    self._identify_key_concerns(comprehensive_analysis, conversation, image_analysis),
+                    timeout=15.0
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.error(f"Key concerns identification failed/timeout: {exc}")
+                return self._create_default_concerns(comprehensive_analysis)
         
         emotional_insights, action_plan, mother_voice, key_concerns = await asyncio.gather(
-            insights_task, action_plan_task, mother_voice_task, concerns_task
+            insights_with_timeout(),
+            action_plan_with_timeout(),
+            mother_voice_with_timeout(),
+            concerns_with_timeout()
         )
+        parallel_time = time.time() - parallel_start
+        print(f"[PERF] Parallel LLM calls completed in {parallel_time:.2f}s", flush=True)
+        logger.info(f"[PERF] Parallel LLM calls completed in {parallel_time:.2f}s")
         
         # 1순위: 상태 개요 (key_concerns 생성 후에 결정하여 일관성 보장)
         status_overview = self._create_status_overview(comprehensive_analysis, key_concerns)
@@ -155,7 +229,11 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt, max_tokens=500)
+            task_start = time.time()
+            response = await self.analysis_service._call_openai(prompt, max_tokens=500, task_name="_generate_emotional_insights")
+            task_time = time.time() - task_start
+            print(f"[PERF] _generate_emotional_insights API call: {task_time:.2f}s", flush=True)
+            logger.debug(f"[PERF] _generate_emotional_insights API call: {task_time:.2f}s")
             return json.loads(response)
         except Exception as exc:
             logger.error("Failed to generate emotional insights: %s", exc)
@@ -228,7 +306,11 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt, max_tokens=1000)
+            task_start = time.time()
+            response = await self.analysis_service._call_openai(prompt, max_tokens=1000, task_name="_generate_actionable_plan")
+            task_time = time.time() - task_start
+            print(f"[PERF] _generate_actionable_plan API call: {task_time:.2f}s", flush=True)
+            logger.debug(f"[PERF] _generate_actionable_plan API call: {task_time:.2f}s")
             data = json.loads(response)
             
             # priority 필드 검증 및 기본값 처리
@@ -289,7 +371,11 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt, max_tokens=400)
+            task_start = time.time()
+            response = await self.analysis_service._call_openai(prompt, max_tokens=400, task_name="_extract_mother_voice")
+            task_time = time.time() - task_start
+            print(f"[PERF] _extract_mother_voice API call: {task_time:.2f}s", flush=True)
+            logger.debug(f"[PERF] _extract_mother_voice API call: {task_time:.2f}s")
             data = json.loads(response)
             return data.get("mother_voice", [])
         except Exception as exc:
@@ -339,7 +425,11 @@ class CaregiverService:
 """
         
         try:
-            response = await self.analysis_service._call_openai(prompt, max_tokens=800)
+            task_start = time.time()
+            response = await self.analysis_service._call_openai(prompt, max_tokens=800, task_name="_identify_key_concerns")
+            task_time = time.time() - task_start
+            print(f"[PERF] _identify_key_concerns API call: {task_time:.2f}s", flush=True)
+            logger.debug(f"[PERF] _identify_key_concerns API call: {task_time:.2f}s")
             data = json.loads(response)
             # Pydantic model_validate로 최적화
             return [KeyConcern.model_validate(concern) for concern in data.get("concerns", [])]
