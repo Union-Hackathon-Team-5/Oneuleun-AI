@@ -8,6 +8,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 EMOTION_LABELS: List[str] = ["기쁨", "분노", "슬픔", "외로움", "무기력함", "행복"]
+CRITICAL_EMOTIONS: List[str] = ["분노", "슬픔", "외로움", "무기력함"]
 
 logger.info("Loaded emotion labels: %s", EMOTION_LABELS)
 print(f"[ContextEmotionLabels] {EMOTION_LABELS}", flush=True)
@@ -132,13 +133,20 @@ class VisionService:
             raise ValueError("감정 레이블은 리스트 형식이어야 합니다.")
 
         if not emotion_list:
-            raise ValueError("최소 하나의 감정 레이블이 필요합니다.")
+            logger.warning("Emotion list empty. Proceeding without emotion labels.")
+            emotion_list = []
+        else:
+            invalid_labels = [label for label in emotion_list if label not in EMOTION_LABELS]
+            if invalid_labels:
+                raise ValueError("감정 레이블이 허용된 목록에 없습니다.")
+            # 한 개만 유지
+            if len(emotion_list) > 1:
+                logger.debug("Trimming emotion list to a single label: %s -> %s", emotion_list, emotion_list[:1])
+                emotion_list = emotion_list[:1]
 
-        invalid_labels = [label for label in emotion_list if label not in EMOTION_LABELS]
-        if invalid_labels:
-            raise ValueError("감정 레이블이 허용된 목록에 없습니다.")
-
-        data["emotion"] = emotion_list
+        # 최종 감정 문자열 결정 (없으면 빈 문자열)
+        emotion_str = emotion_list[0] if emotion_list else ""
+        data["emotion"] = emotion_str
 
         summary = data.get("summary")
         if not isinstance(summary, str) or not summary.strip():
@@ -146,9 +154,9 @@ class VisionService:
 
         concerns = data.get("concerns")
         if concerns is None:
-            data["concerns"] = []
+            concerns_list: List[str] = []
         elif isinstance(concerns, str):
-            data["concerns"] = [concerns] if concerns.strip() else []
+            concerns_list = [concerns] if concerns.strip() else []
         elif isinstance(concerns, list):
             normalized_concerns = []
             for item in concerns:
@@ -157,6 +165,14 @@ class VisionService:
                 stripped = item.strip()
                 if stripped:
                     normalized_concerns.append(stripped)
-            data["concerns"] = normalized_concerns
+            concerns_list = normalized_concerns[:1]
         else:
             raise ValueError("concerns 항목은 리스트 또는 문자열이어야 합니다.")
+
+        if not concerns_list and emotion_str in CRITICAL_EMOTIONS:
+            auto_concern = f"{emotion_str}이 강하게 드러나 걱정됩니다."
+            logger.info("Auto-filling concern for critical emotion '%s': %s", emotion_str, auto_concern)
+            concerns_list = [auto_concern]
+
+        concern_str = concerns_list[0] if concerns_list else ""
+        data["concerns"] = concern_str

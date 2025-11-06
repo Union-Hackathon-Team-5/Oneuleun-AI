@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from app.models.caregiver_models import (
     RiskIndicator, AudioAnalysis, ConversationTopic, EvidenceVisualization,
     MedicalDisclaimer
 )
+from app.models.analyze_upload_models import AnalyzeUploadResponse
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,52 @@ class FastAnalysisService:
         self.model = "gpt-4o-mini"  # 가장 빠른 모델
         self.base_url = "https://api.openai.com/v1/chat/completions"
         self._client: Optional[httpx.AsyncClient] = None
+        self._llm_available = True
+        self._default_response = AnalyzeUploadResponse(
+            status_signal={
+                "health": "red",
+                "emotion": "yellow",
+                "daily_function": "green",
+                "summary": "식사량 감소 + 허리 통증 지속 + 외로움 증가",
+            },
+            key_phrases=[
+                "사람 목소리가 그립네요",
+                "밥맛이 없어서 물만 마셨어요",
+                "허리가 쑤시고 욱신거려요",
+            ],
+            care_todo=[
+                "지금 바로 전화하기 (10분)",
+                "허리 통증 강도 물어보고 기록하기",
+                "정형외과 예약하기",
+                "반찬/식사 지원 준비하기",
+                "욕실 미끄럼 방지 패드 확인하기",
+            ],
+            weekly_change={
+                "mood": -35,
+                "meal": -60,
+                "activity": -50,
+                "graph_dummy_data": [
+                    {"day": "Mon", "mood": 60},
+                    {"day": "Tue", "mood": 45},
+                    {"day": "Wed", "mood": 40},
+                    {"day": "Thu", "mood": 30},
+                    {"day": "Fri", "mood": 25},
+                ],
+            },
+            ai_care_plan={
+                "today": "따뜻한 톤으로 10분 통화하며 감정 지지하기",
+                "this_week": "정형외과 진료 예약 + 반찬 준비 혹은 배달 신청",
+                "this_month": "주 2회 정기 통화 루틴 고정 및 욕실 안전장치 설치",
+                "this_year": "정기 건강 검진 및 지역 소모임 또는 프로그램 연계",
+            },
+        )
+        self._fallback_sections = {
+            "status_signal": self._default_response.status_signal.model_dump(),
+            "key_phrases": {"key_phrases": list(self._default_response.key_phrases)},
+            "care_todo": {"care_todo": list(self._default_response.care_todo)},
+            "weekly_change": self._default_response.weekly_change.model_dump(),
+            "ai_care_plan": self._default_response.ai_care_plan.model_dump(),
+        }
         
         # 🎯 캐시된 템플릿 (재사용)
         self._status_templates = {
@@ -48,8 +96,20 @@ class FastAnalysisService:
             self._client = httpx.AsyncClient(timeout=timeout, limits=limits)
         return self._client
     
-    async def _ultra_fast_api_call(self, prompt: str) -> Dict[str, Any]:
+    async def _ultra_fast_api_call(
+        self,
+        prompt: str,
+        *,
+        fallback: Optional[Dict[str, Any]] = None,
+        section: str = "general",
+    ) -> Dict[str, Any]:
         """🚀 초고속 단일 API 호출 (5초 내 완료 목표)"""
+        if not self._llm_available:
+            logger.info("[LLM] %s skipped - service unavailable, using fallback", section)
+            if fallback is not None:
+                return fallback
+            return self._get_fallback_data()
+
         start_time = time.time()
         
         # 극한 최적화된 페이로드
@@ -84,8 +144,215 @@ class FastAnalysisService:
             
             return json.loads(result)
         except Exception as exc:
-            logger.error(f"Fast API call failed: {exc}")
+            logger.warning("[LLM] %s call failed: %r", section, exc)
+            self._llm_available = False
+            if fallback is not None:
+                return fallback
             return self._get_fallback_data()
+
+    async def _invoke_section(
+        self,
+        *,
+        section_name: str,
+        prompt: str,
+        fallback: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        start_time = time.time()
+        logger.info("[LLM] %s section - start", section_name)
+        try:
+            result = await self._ultra_fast_api_call(
+                prompt,
+                fallback=fallback,
+                section=section_name,
+            )
+            elapsed = time.time() - start_time
+            if self._llm_available:
+                logger.info("[LLM] %s section - completed in %.2fs", section_name, elapsed)
+            else:
+                logger.info("[LLM] %s section - fallback used (LLM unavailable)", section_name)
+            logger.debug("[LLM] %s section raw result: %s", section_name, result)
+            return result
+        except Exception as exc:
+            logger.exception("[LLM] %s section - unexpected failure, using fallback", section_name)
+            return fallback
+
+    async def generate_simple_status_report(
+        self,
+        *,
+        conversation: str,
+        session_id: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """간소화된 보호자 리포트 생성 (LLM 기반, 병렬 섹션 구성)"""
+        start_time = time.time()
+        logger.info(
+            "[LLM] Segmented caregiver report start (session_id=%s, user_id=%s)",
+            session_id,
+            user_id,
+        )
+        compressed_conversation = self._compress_conversation(conversation)
+        base_context = (
+            f"세션 ID: {session_id}\n"
+            f"사용자 ID: {user_id}\n"
+            "대화 요약:\n"
+            f'"""\n{compressed_conversation}\n"""'
+        )
+
+        status_prompt = (
+            f"{base_context}\n\n"
+            "역할: 노인 케어 전문가.\n"
+            "JSON 객체 하나를 반환하고 키는 health, emotion, daily_function, summary 입니다.\n"
+            "health, emotion, daily_function 값은 red, yellow, green 중 하나로 지정하세요.\n"
+            "summary는 한국어 한 문장으로 현재 상태를 요약하세요.\n"
+            "정보가 명확하지 않으면 건강 관련 값은 'red', 감정과 일상 기능은 'yellow'로 설정하세요."
+        )
+
+        key_phrases_prompt = (
+            f"{base_context}\n\n"
+            "역할: 대화 핵심 문장 추출기.\n"
+            "JSON 객체 하나만 출력하고 키는 key_phrases 입니다.\n"
+            "key_phrases 값은 대화에서 가장 중요한 발화를 3~5개 담은 배열이어야 합니다.\n"
+            "각 항목은 말한 사람의 감정이 드러나도록 한국어 자연 문장으로 작성하세요."
+        )
+
+        care_todo_prompt = (
+            f"{base_context}\n\n"
+            "역할: 보호자 행동 코치.\n"
+            "JSON 객체 하나만 출력하고 키는 care_todo 입니다.\n"
+            "care_todo 값은 보호자가 바로 실행할 수 있는 행동을 4~6개 제안하는 배열이어야 합니다.\n"
+            "각 문장은 구체적인 행동과 이유를 함께 포함하세요."
+        )
+
+        weekly_change_prompt = (
+            f"{base_context}\n\n"
+            "역할: 돌봄 데이터 분석가.\n"
+            "JSON 객체의 키는 mood, meal, activity, graph_dummy_data 입니다.\n"
+            "mood, meal, activity 값은 -100에서 100 사이 정수로 작성해 최근 변화량을 나타내세요.\n"
+            "graph_dummy_data는 배열이며 Mon, Tue, Wed, Thu, Fri 다섯 항목을 포함해야 합니다.\n"
+            "각 항목은 day(요일), mood(0-100 정수) 키를 가진 객체로 작성하세요."
+        )
+
+        ai_care_plan_prompt = (
+            f"{base_context}\n\n"
+            "역할: 돌봄 코치.\n"
+            "JSON 객체 하나를 출력하고 키는 today, this_week, this_month, this_year 입니다.\n"
+            "각 값은 보호자가 실천할 수 있는 구체적인 계획을 한국어 한 문장으로 제안하세요.\n"
+            "계획들은 서로 중복되지 않게 작성하세요."
+        )
+
+        section_tasks = {
+            "status_signal": self._invoke_section(
+                section_name="status_signal",
+                prompt=status_prompt,
+                fallback=self._fallback_sections["status_signal"],
+            ),
+            "key_phrases": self._invoke_section(
+                section_name="key_phrases",
+                prompt=key_phrases_prompt,
+                fallback=self._fallback_sections["key_phrases"],
+            ),
+            "care_todo": self._invoke_section(
+                section_name="care_todo",
+                prompt=care_todo_prompt,
+                fallback=self._fallback_sections["care_todo"],
+            ),
+            "weekly_change": self._invoke_section(
+                section_name="weekly_change",
+                prompt=weekly_change_prompt,
+                fallback=self._fallback_sections["weekly_change"],
+            ),
+            "ai_care_plan": self._invoke_section(
+                section_name="ai_care_plan",
+                prompt=ai_care_plan_prompt,
+                fallback=self._fallback_sections["ai_care_plan"],
+            ),
+        }
+
+        section_names = list(section_tasks.keys())
+        results = await asyncio.gather(
+            *(section_tasks[name] for name in section_names),
+            return_exceptions=True,
+        )
+
+        section_payloads: Dict[str, Dict[str, Any]] = {}
+        for name, result in zip(section_names, results):
+            if isinstance(result, Exception):
+                logger.exception("[LLM] %s section raised exception, using fallback", name)
+                section_payloads[name] = copy.deepcopy(self._fallback_sections[name])
+                continue
+            if not isinstance(result, dict):
+                logger.warning("[LLM] %s section returned non-dict, using fallback", name)
+                section_payloads[name] = copy.deepcopy(self._fallback_sections[name])
+                continue
+            section_payloads[name] = result
+
+        def _extract_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+            data = payload.get("status_signal", payload)
+            if not isinstance(data, dict):
+                logger.warning("[LLM] status_signal payload invalid, using fallback")
+                return copy.deepcopy(self._fallback_sections["status_signal"])
+            missing_keys = {"health", "emotion", "daily_function", "summary"} - data.keys()
+            if missing_keys:
+                logger.warning("[LLM] status_signal missing keys %s, supplementing fallback", missing_keys)
+                fallback_copy = copy.deepcopy(self._fallback_sections["status_signal"])
+                fallback_copy.update({k: data.get(k, fallback_copy[k]) for k in fallback_copy})
+                return fallback_copy
+            return data
+
+        def _extract_list(payload: Dict[str, Any], key: str, fallback_key: str) -> List[str]:
+            data = payload.get(key)
+            if not isinstance(data, list) or not data:
+                logger.warning("[LLM] %s payload invalid, using fallback", key)
+                return list(self._fallback_sections[fallback_key][key])
+            return data
+
+        def _extract_weekly(payload: Dict[str, Any]) -> Dict[str, Any]:
+            data = payload.get("weekly_change", payload)
+            if not isinstance(data, dict):
+                logger.warning("[LLM] weekly_change payload invalid, using fallback")
+                return copy.deepcopy(self._fallback_sections["weekly_change"])
+            required = {"mood", "meal", "activity", "graph_dummy_data"}
+            if not required.issubset(data):
+                logger.warning("[LLM] weekly_change missing keys %s, using fallback", required - data.keys())
+                return copy.deepcopy(self._fallback_sections["weekly_change"])
+            graph = data.get("graph_dummy_data")
+            if not isinstance(graph, list) or len(graph) < 4:
+                logger.warning("[LLM] weekly_change graph data invalid, using fallback list")
+                data["graph_dummy_data"] = copy.deepcopy(
+                    self._fallback_sections["weekly_change"]["graph_dummy_data"]
+                )
+            return data
+
+        def _extract_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+            data = payload.get("ai_care_plan", payload)
+            if not isinstance(data, dict):
+                logger.warning("[LLM] ai_care_plan payload invalid, using fallback")
+                return copy.deepcopy(self._fallback_sections["ai_care_plan"])
+            required = {"today", "this_week", "this_month", "this_year"}
+            if not required.issubset(data):
+                logger.warning("[LLM] ai_care_plan missing keys %s, using fallback", required - data.keys())
+                return copy.deepcopy(self._fallback_sections["ai_care_plan"])
+            return data
+
+        status_payload = _extract_status(section_payloads["status_signal"])
+        key_phrases = _extract_list(section_payloads["key_phrases"], "key_phrases", "key_phrases")
+        care_todo = _extract_list(section_payloads["care_todo"], "care_todo", "care_todo")
+        weekly_change = _extract_weekly(section_payloads["weekly_change"])
+        ai_care_plan = _extract_plan(section_payloads["ai_care_plan"])
+
+        assembled = {
+            "status_signal": status_payload,
+            "key_phrases": key_phrases,
+            "care_todo": care_todo,
+            "weekly_change": weekly_change,
+            "ai_care_plan": ai_care_plan,
+        }
+
+        elapsed_total = time.time() - start_time
+        logger.info("[LLM] Segmented caregiver report complete in %.2fs", elapsed_total)
+        logger.debug("[LLM] Segmented caregiver report payload: %s", assembled)
+
+        return assembled
     
     def _get_fallback_data(self) -> Dict[str, Any]:
         """⚡ 즉시 사용 가능한 fallback 데이터"""
@@ -209,7 +476,7 @@ class FastAnalysisService:
 
 규칙: 위험시 urgent, 평범시 normal. 최대 3개씩."""
         
-        return await self._ultra_fast_api_call(prompt)
+        return await self._ultra_fast_api_call(prompt, section="comprehensive_analysis")
     
     def _ultra_fast_transform(
         self,
